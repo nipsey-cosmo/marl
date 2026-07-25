@@ -167,6 +167,15 @@ test("init is idempotent and preserves existing settings", () => {
   assert.equal(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8").match(/marl prime/g).length, 1);
 });
 
+test("--json emits parseable records", () => {
+  const records = JSON.parse(marl("prime", "db", "--json").out);
+  assert.equal(records[0].text, "Use WAL mode for SQLite");
+  assert.equal(records[0].domain, "db");
+  assert.deepEqual(JSON.parse(marl("prime", "nosuchdomain", "--json").out), []);
+  assert.deepEqual(JSON.parse(marl("search", "zzzznomatch", "--json").out), []);
+  assert.equal(JSON.parse(marl("search", "sqlite", "--json").out)[0].text, "Use WAL mode for SQLite");
+});
+
 test("errors exit non-zero", () => {
   assert.equal(marl("record", "db").code, 1);
   assert.equal(marl("record", "db", "x", "--type", "bogus").code, 1);

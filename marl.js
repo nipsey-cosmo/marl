@@ -203,13 +203,14 @@ const cmds = {
   prime(args) {
     const { values, positionals } = parseArgs({
       args,
-      options: { limit: { type: "string" } },
+      options: { limit: { type: "string" }, json: { type: "boolean", default: false } },
       allowPositionals: true,
     });
     const [domain] = positionals;
     let records = load();
     if (domain) records = records.filter((r) => r.domain === domain);
     if (records.length === 0) {
+      if (values.json) return console.log("[]");
       console.log(domain ? `No knowledge for domain "${domain}".` : "No knowledge recorded yet. Use: marl record <domain> <text...>");
       return;
     }
@@ -222,6 +223,8 @@ const cmds = {
       omitted = Math.max(0, records.length - n);
       records = [...records].sort(byTrust).slice(0, n);
     }
+
+    if (values.json) return console.log(JSON.stringify([...records].sort(byTrust)));
 
     console.log("# Project knowledge (.marl)\n");
     const domains = [...new Set(records.map((r) => r.domain))].sort();
@@ -237,8 +240,13 @@ const cmds = {
   },
 
   search(args) {
-    if (args.length === 0) fail("usage: marl search <query...>");
-    const terms = args.join(" ").toLowerCase().split(/\s+/);
+    const { values, positionals } = parseArgs({
+      args,
+      options: { json: { type: "boolean", default: false } },
+      allowPositionals: true,
+    });
+    if (positionals.length === 0) fail("usage: marl search <query...> [--json]");
+    const terms = positionals.join(" ").toLowerCase().split(/\s+/);
     // ponytail: term-count scoring, BM25 when corpus outgrows a screenful
     const hits = load()
       .map((r) => {
@@ -247,6 +255,7 @@ const cmds = {
       })
       .filter((h) => h.score > 0)
       .sort((a, b) => b.score - a.score || b.r.confirms - a.r.confirms);
+    if (values.json) return console.log(JSON.stringify(hits.map((h) => h.r)));
     if (hits.length === 0) {
       console.log("No matches.");
       return;
@@ -332,8 +341,8 @@ if (!cmd || !cmds[cmd]) {
 usage:
   marl init [--no-hook]      set up .marl, agent instructions, session hook
   marl record <domain> <text...> [--type ${TYPES.join("|")}] [--tags a,b]
-  marl prime [domain] [--limit n]      print knowledge, most-confirmed first
-  marl search <query...>     find records
+  marl prime [domain] [--limit n] [--json]   print knowledge, most-confirmed first
+  marl search <query...> [--json]      find records
   marl confirm <id>          mark a record as applied and correct
   marl revise <id> <text...> replace a record that turned out wrong
   marl drop <id> [reason...] archive a record that no longer applies
