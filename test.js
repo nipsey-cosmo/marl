@@ -50,9 +50,169 @@ test("record → prime → search → confirm → prune round trip", () => {
   assert.match(fs.readFileSync(path.join(cwd, ".marl", "archive.jsonl"), "utf8"), /Rate limit/);
 });
 
+test("prime does not rescue a stale record", () => {
+  const file = path.join(cwd, ".marl", "knowledge.jsonl");
+  marl("record", "stale", "Old fact");
+  const records = fs.readFileSync(file, "utf8").trim().split("\n").map(JSON.parse);
+  records.at(-1).created = "2020-01-01T00:00:00.000Z";
+  fs.writeFileSync(file, records.map((x) => JSON.stringify(x)).join("\n") + "\n");
+
+  marl("prime"); // must not stamp last_used — otherwise prune is a permanent no-op
+  assert.match(marl("prune", "--days", "30", "--dry-run").out, /would archive stale/);
+});
+
+test("revise supersedes, drop archives", () => {
+  let r = marl("record", "cache", "TTL is 60s", "--type", "convention", "--tags", "redis");
+  const id = r.out.match(/\[(\w{6})\]/)[1];
+  marl("confirm", id);
+
+  r = marl("revise", id.slice(0, 3), "TTL is 300s"); // id prefix resolves
+  assert.equal(r.code, 0);
+  const newId = r.out.match(/→ \[(\w{6})\]/)[1];
+
+  r = marl("prime", "cache");
+  assert.match(r.out, /TTL is 300s/);
+  assert.doesNotMatch(r.out, /60s/);
+  assert.doesNotMatch(r.out, /×1/); // confirms reset — corrected knowledge re-earns trust
+  assert.match(r.out, /convention/);
+  assert.match(r.out, /#redis/); // type and tags carried over
+
+  r = marl("drop", newId, "cache removed entirely");
+  assert.equal(r.code, 0);
+  assert.doesNotMatch(marl("prime").out, /TTL is/);
+  const archived = fs.readFileSync(path.join(cwd, ".marl", "archive.jsonl"), "utf8");
+  assert.match(archived, /revised by/);
+  assert.match(archived, /cache removed entirely/);
+});
+
+test("record warns on near-duplicates and new domains", () => {
+  marl("record", "http", "Retry on 429 with exponential backoff");
+
+  let r = marl("record", "http", "Retry on 429 using exponential backoff");
+  assert.match(r.out, /similar:/);
+  assert.match(r.out, /same fact\?/);
+  assert.doesNotMatch(r.out, /new domain/); // http already exists
+
+  r = marl("record", "http", "Timeouts are 30 seconds");
+  assert.doesNotMatch(r.out, /similar:/); // unrelated fact, same domain
+
+  r = marl("record", "htp", "Typo domain");
+  assert.match(r.out, /new domain "htp" — existing: .*http/);
+});
+
+test("prime ranks by confirms and reports what --limit omitted", () => {
+  const id = marl("record", "rank", "Proven fact").out.match(/\[(\w{6})\]/)[1];
+  marl("record", "rank", "Unproven fact");
+  marl("confirm", id);
+
+  let r = marl("prime", "rank");
+  assert.ok(r.out.indexOf("Proven") < r.out.indexOf("Unproven"), "confirmed record should lead");
+
+  r = marl("prime", "rank", "--limit", "1");
+  assert.match(r.out, /Proven/);
+  assert.doesNotMatch(r.out, /Unproven/);
+  assert.match(r.out, /1 less-confirmed record\(s\) omitted/);
+  assert.equal(marl("prime", "--limit", "0").code, 1);
+});
+
+test("finds .marl from a subdirectory", () => {
+  const sub = path.join(cwd, "packages", "api");
+  fs.mkdirSync(sub, { recursive: true });
+  const res = spawnSync(process.execPath, [CLI, "prime", "db"], { cwd: sub, encoding: "utf8" });
+  assert.match(res.stdout, /WAL mode/); // parent store, not a new empty one
+  assert.ok(!fs.existsSync(path.join(sub, ".marl")));
+});
+
+test("survives hand-edited records", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-edit-"));
+  const file = path.join(dir, ".marl", "knowledge.jsonl");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const run = (...a) => spawnSync(process.execPath, [CLI, ...a], { cwd: dir, encoding: "utf8" });
+
+  // minimal record typed by hand: no tags, no confirms, no last_used
+  fs.writeFileSync(file, JSON.stringify({ id: "aaa111", domain: "db", type: "note", text: "Hand written", created: "2024-01-01T00:00:00.000Z" }) + "\n");
+  assert.match(run("prime").stdout, /Hand written/);
+  assert.equal(run("confirm", "aaa111").status, 0);
+
+  fs.appendFileSync(file, "{not json\n");
+  const bad = run("prime");
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /knowledge\.jsonl:2 is not valid JSON/);
+
+  fs.writeFileSync(file, JSON.stringify({ id: "bbb222", domain: "db" }) + "\n");
+  assert.match(run("prime").stderr, /missing "type"/);
+});
+
+test("init is idempotent and preserves existing settings", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-init-"));
+  const run = (...a) => spawnSync(process.execPath, [CLI, "init", ...a], { cwd: dir, encoding: "utf8" });
+  const settingsFile = path.join(dir, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+  fs.writeFileSync(settingsFile, JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [] }] } }));
+
+  let out = run().stdout;
+  assert.match(out, /added agent instructions/);
+  assert.match(out, /SessionStart/);
+  assert.ok(fs.existsSync(path.join(dir, ".marl")));
+  assert.match(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8"), /marl prime/);
+
+  const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+  assert.equal(settings.model, "opus"); // untouched
+  assert.ok(settings.hooks.Stop); // untouched
+  assert.equal(settings.hooks.SessionStart[0].hooks[0].command, "marl prime");
+
+  out = run().stdout;
+  assert.match(out, /instructions up to date/);
+  assert.match(out, /already installed/);
+  assert.equal(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8").match(/marl prime/g).length, 1);
+});
+
+test("init refreshes its own block, leaves the rest of the file alone", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-block-"));
+  const md = path.join(dir, "CLAUDE.md");
+  const run = () => spawnSync(process.execPath, [CLI, "init", "--no-hook"], { cwd: dir, encoding: "utf8" });
+
+  fs.writeFileSync(md, "# My project\n\nMy own notes.\n");
+  run();
+  let text = fs.readFileSync(md, "utf8");
+  assert.match(text, /My own notes/);
+  assert.match(text, /marl:start/);
+
+  // simulate an outdated block from a previous version
+  fs.writeFileSync(md, text.replace(/marl prime[\s\S]*?marl:end/, "OLD INSTRUCTIONS\n<!-- marl:end"));
+  assert.match(run().stdout, /updated agent instructions/);
+  text = fs.readFileSync(md, "utf8");
+  assert.doesNotMatch(text, /OLD INSTRUCTIONS/);
+  assert.match(text, /marl revise/);
+  assert.match(text, /My own notes/); // surrounding content preserved
+  assert.equal(text.match(/marl:start/g).length, 1);
+
+  // a pre-0.2.0 unmarked block is reported, never clobbered
+  fs.writeFileSync(md, "# My project\n\nRun `marl prime` at session start.\n");
+  assert.match(run().stdout, /unmarked marl instructions/);
+  assert.equal(fs.readFileSync(md, "utf8"), "# My project\n\nRun `marl prime` at session start.\n");
+});
+
+test("--version reports the package version", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, "package.json"), "utf8"));
+  assert.equal(marl("--version").out.trim(), pkg.version);
+  assert.match(marl("--help").out, new RegExp(`marl ${pkg.version}`));
+});
+
+test("--json emits parseable records", () => {
+  const records = JSON.parse(marl("prime", "db", "--json").out);
+  assert.equal(records[0].text, "Use WAL mode for SQLite");
+  assert.equal(records[0].domain, "db");
+  assert.deepEqual(JSON.parse(marl("prime", "nosuchdomain", "--json").out), []);
+  assert.deepEqual(JSON.parse(marl("search", "zzzznomatch", "--json").out), []);
+  assert.equal(JSON.parse(marl("search", "sqlite", "--json").out)[0].text, "Use WAL mode for SQLite");
+});
+
 test("errors exit non-zero", () => {
   assert.equal(marl("record", "db").code, 1);
   assert.equal(marl("record", "db", "x", "--type", "bogus").code, 1);
   assert.equal(marl("confirm", "nope00").code, 1);
+  assert.equal(marl("revise", "nope00", "x").code, 1);
+  assert.equal(marl("drop").code, 1);
   assert.equal(marl("frobnicate").code, 1);
 });
