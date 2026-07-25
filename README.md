@@ -21,8 +21,12 @@ marl prime            # all knowledge, markdown — inject into agent context
 marl prime db         # one domain
 marl search sqlite    # find records
 marl confirm a1b2c3   # "I applied this and it was right" — boosts survival
-marl prune --days 90  # archive records nothing has touched in 90 days
+marl revise a1b2c3 "Use WAL mode except in CI"   # this record was wrong
+marl drop a1b2c3 "moved to Postgres"             # no longer applies
+marl prune --days 90  # archive records nothing has confirmed in 90 days
 ```
+
+Ids accept any unambiguous prefix (`marl confirm a1b`). `revise` archives the old record and creates a replacement carrying its domain, type and tags but with confirms reset — corrected knowledge re-earns trust. Nothing is ever deleted; `revise`, `drop` and `prune` all append to `.marl/archive.jsonl` with a reason.
 
 Types: `convention`, `pattern`, `failure`, `decision`, `note`.
 

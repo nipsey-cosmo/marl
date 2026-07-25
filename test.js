@@ -61,9 +61,35 @@ test("prime does not rescue a stale record", () => {
   assert.match(marl("prune", "--days", "30", "--dry-run").out, /would archive stale/);
 });
 
+test("revise supersedes, drop archives", () => {
+  let r = marl("record", "cache", "TTL is 60s", "--type", "convention", "--tags", "redis");
+  const id = r.out.match(/\[(\w{6})\]/)[1];
+  marl("confirm", id);
+
+  r = marl("revise", id.slice(0, 3), "TTL is 300s"); // id prefix resolves
+  assert.equal(r.code, 0);
+  const newId = r.out.match(/→ \[(\w{6})\]/)[1];
+
+  r = marl("prime", "cache");
+  assert.match(r.out, /TTL is 300s/);
+  assert.doesNotMatch(r.out, /60s/);
+  assert.doesNotMatch(r.out, /×1/); // confirms reset — corrected knowledge re-earns trust
+  assert.match(r.out, /convention/);
+  assert.match(r.out, /#redis/); // type and tags carried over
+
+  r = marl("drop", newId, "cache removed entirely");
+  assert.equal(r.code, 0);
+  assert.doesNotMatch(marl("prime").out, /TTL is/);
+  const archived = fs.readFileSync(path.join(cwd, ".marl", "archive.jsonl"), "utf8");
+  assert.match(archived, /revised by/);
+  assert.match(archived, /cache removed entirely/);
+});
+
 test("errors exit non-zero", () => {
   assert.equal(marl("record", "db").code, 1);
   assert.equal(marl("record", "db", "x", "--type", "bogus").code, 1);
   assert.equal(marl("confirm", "nope00").code, 1);
+  assert.equal(marl("revise", "nope00", "x").code, 1);
+  assert.equal(marl("drop").code, 1);
   assert.equal(marl("frobnicate").code, 1);
 });

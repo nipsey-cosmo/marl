@@ -36,6 +36,26 @@ function fail(msg) {
   process.exit(1);
 }
 
+function newId(records) {
+  let id;
+  do id = randomBytes(3).toString("hex");
+  while (records.some((r) => r.id === id));
+  return id;
+}
+
+function find(records, id) {
+  const exact = records.find((r) => r.id === id);
+  if (exact) return exact;
+  const prefixed = records.filter((r) => r.id.startsWith(id));
+  if (prefixed.length === 0) fail(`no record with id "${id}"`);
+  if (prefixed.length > 1) fail(`id "${id}" is ambiguous: ${prefixed.map((r) => r.id).join(", ")}`);
+  return prefixed[0];
+}
+
+function archive(records, reason) {
+  append(records.map((r) => ({ ...r, archived: new Date().toISOString(), reason })), ARCHIVE);
+}
+
 function line(r) {
   const badge = r.confirms > 0 ? `, ×${r.confirms}` : "";
   const tags = r.tags?.length ? ` #${r.tags.join(" #")}` : "";
@@ -53,7 +73,7 @@ const cmds = {
     if (!domain || text.length === 0) fail("usage: marl record <domain> <text...> [--type t] [--tags a,b]");
     if (!TYPES.includes(values.type)) fail(`type must be one of: ${TYPES.join(", ")}`);
     const rec = {
-      id: randomBytes(3).toString("hex"),
+      id: newId(load()),
       domain,
       type: values.type,
       text: text.join(" "),
@@ -104,12 +124,48 @@ const cmds = {
     for (const h of hits) console.log(`${h.r.domain} ${line(h.r)}`);
   },
 
+  revise(args) {
+    const { values, positionals } = parseArgs({
+      args,
+      options: { type: { type: "string" }, tags: { type: "string" } },
+      allowPositionals: true,
+    });
+    const [id, ...text] = positionals;
+    if (!id || text.length === 0) fail("usage: marl revise <id> <text...> [--type t] [--tags a,b]");
+    if (values.type && !TYPES.includes(values.type)) fail(`type must be one of: ${TYPES.join(", ")}`);
+    const records = load();
+    const old = find(records, id);
+    const rec = {
+      ...old,
+      id: newId(records),
+      type: values.type ?? old.type,
+      text: text.join(" "),
+      tags: values.tags ? values.tags.split(",").map((t) => t.trim()).filter(Boolean) : old.tags,
+      created: new Date().toISOString(),
+      last_used: null,
+      confirms: 0, // corrected knowledge earns trust again from scratch
+      supersedes: old.id,
+    };
+    archive([old], `revised by ${rec.id}`);
+    save([...records.filter((r) => r.id !== old.id), rec]);
+    console.log(`revised [${old.id}] → [${rec.id}] ${rec.text}`);
+  },
+
+  drop(args) {
+    const [id, ...reason] = args;
+    if (!id) fail("usage: marl drop <id> [reason...]");
+    const records = load();
+    const rec = find(records, id);
+    archive([rec], reason.join(" ") || "dropped");
+    save(records.filter((r) => r.id !== rec.id));
+    console.log(`dropped [${rec.id}] ${rec.text}`);
+  },
+
   confirm(args) {
     const [id] = args;
     if (!id) fail("usage: marl confirm <id>");
     const records = load();
-    const rec = records.find((r) => r.id === id);
-    if (!rec) fail(`no record with id "${id}"`);
+    const rec = find(records, id);
     rec.confirms += 1;
     rec.last_used = new Date().toISOString();
     save(records);
@@ -133,7 +189,7 @@ const cmds = {
     for (const r of stale) console.log(`${values["dry-run"] ? "would archive" : "archived"} ${r.domain} ${line(r)}`);
     if (!values["dry-run"]) {
       const staleIds = new Set(stale.map((r) => r.id));
-      append(stale.map((r) => ({ ...r, archived: new Date().toISOString() })), ARCHIVE);
+      archive(stale, `unconfirmed for ${days} days`);
       save(records.filter((r) => !staleIds.has(r.id)));
     }
   },
@@ -148,6 +204,8 @@ usage:
   marl prime [domain]        print knowledge (touches last_used)
   marl search <query...>     find records
   marl confirm <id>          mark a record as applied and correct
+  marl revise <id> <text...> replace a record that turned out wrong
+  marl drop <id> [reason...] archive a record that no longer applies
   marl prune [--days 90] [--dry-run]   archive records untouched for N days`);
   process.exit(cmd ? 1 : 0);
 }
