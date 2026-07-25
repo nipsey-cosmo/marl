@@ -108,7 +108,64 @@ function line(r) {
   return `- [${r.id}] (${r.type}${badge}) ${r.text}${tags}`;
 }
 
+const AGENT_BLOCK = `## marl — this project's knowledge store
+
+Run \`marl prime\` at session start and treat the output as project ground truth.
+
+- **Before recording:** \`marl search <keywords>\` — if the fact already exists, \`marl confirm <id>\` instead of duplicating it.
+- **Before finishing a task:** record non-obvious learnings — \`marl record <domain> "<text>" --type ${TYPES.join("|")}\`.
+- **When a primed record proves correct in practice:** \`marl confirm <id>\`. Confirm means "I applied this and it held", not "I read it" — confirming everything you prime destroys the signal that keeps knowledge alive.
+- **When a primed record proves wrong:** \`marl revise <id> "<corrected text>"\`. Never record a contradicting fact alongside the old one. If it no longer applies at all, \`marl drop <id> "<reason>"\`.
+- **When committing:** include \`.marl/\` in the same commit as the change that produced the learning.
+
+One fact per record, written so a stranger can act on it without context: gotchas with their resolution (\`failure\`), choices with their reason (\`decision\`), "always do X here" rules (\`convention\`), reusable approaches (\`pattern\`). Do not record anything derivable by reading the code, session-specific state, secrets, or restatements of the task.
+
+Domains are short, stable, lowercase labels (\`db\`, \`api\`, \`auth\`, \`build\`). Reuse an existing one before inventing a new one.
+`;
+
 const cmds = {
+  init(args) {
+    const { values } = parseArgs({ args, options: { "no-hook": { type: "boolean", default: false } } });
+    const here = path.join(process.cwd(), ".marl");
+    if (fs.existsSync(DIR) && DIR !== here) console.log(`note: existing store at ${DIR} — this creates a separate one`);
+    fs.mkdirSync(here, { recursive: true });
+    console.log(`store: ${here}`);
+
+    const targets = ["CLAUDE.md", "AGENTS.md"].filter((f) => fs.existsSync(path.join(process.cwd(), f)));
+    for (const name of targets.length ? targets : ["CLAUDE.md"]) {
+      const file = path.join(process.cwd(), name);
+      const current = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+      if (current.includes("marl prime")) {
+        console.log(`${name}: already documented`);
+        continue;
+      }
+      fs.writeFileSync(file, (current ? `${current.trimEnd()}\n\n` : "") + AGENT_BLOCK);
+      console.log(`${name}: added agent instructions`);
+    }
+    if (values["no-hook"]) return;
+
+    // step 1 of the loop shouldn't depend on an agent remembering to run a command
+    const file = path.join(process.cwd(), ".claude", "settings.json");
+    let settings = {};
+    if (fs.existsSync(file)) {
+      try {
+        settings = JSON.parse(fs.readFileSync(file, "utf8"));
+      } catch {
+        fail(`${file} is not valid JSON — fix it, or run: marl init --no-hook`);
+      }
+    }
+    settings.hooks ??= {};
+    settings.hooks.SessionStart ??= [];
+    if (JSON.stringify(settings.hooks.SessionStart).includes("marl prime")) {
+      console.log("hook: already installed");
+      return;
+    }
+    settings.hooks.SessionStart.push({ hooks: [{ type: "command", command: "marl prime" }] });
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n");
+    console.log(`hook: SessionStart → marl prime (${file})`);
+  },
+
   record(args) {
     const { values, positionals } = parseArgs({
       args,
@@ -273,6 +330,7 @@ if (!cmd || !cmds[cmd]) {
   console.log(`marl — project knowledge for AI agents
 
 usage:
+  marl init [--no-hook]      set up .marl, agent instructions, session hook
   marl record <domain> <text...> [--type ${TYPES.join("|")}] [--tags a,b]
   marl prime [domain] [--limit n]      print knowledge, most-confirmed first
   marl search <query...>     find records

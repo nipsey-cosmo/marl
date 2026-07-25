@@ -143,6 +143,30 @@ test("survives hand-edited records", () => {
   assert.match(run("prime").stderr, /missing "type"/);
 });
 
+test("init is idempotent and preserves existing settings", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-init-"));
+  const run = (...a) => spawnSync(process.execPath, [CLI, "init", ...a], { cwd: dir, encoding: "utf8" });
+  const settingsFile = path.join(dir, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+  fs.writeFileSync(settingsFile, JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [] }] } }));
+
+  let out = run().stdout;
+  assert.match(out, /added agent instructions/);
+  assert.match(out, /SessionStart/);
+  assert.ok(fs.existsSync(path.join(dir, ".marl")));
+  assert.match(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8"), /marl prime/);
+
+  const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+  assert.equal(settings.model, "opus"); // untouched
+  assert.ok(settings.hooks.Stop); // untouched
+  assert.equal(settings.hooks.SessionStart[0].hooks[0].command, "marl prime");
+
+  out = run().stdout;
+  assert.match(out, /already documented/);
+  assert.match(out, /already installed/);
+  assert.equal(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8").match(/marl prime/g).length, 1);
+});
+
 test("errors exit non-zero", () => {
   assert.equal(marl("record", "db").code, 1);
   assert.equal(marl("record", "db", "x", "--type", "bogus").code, 1);
