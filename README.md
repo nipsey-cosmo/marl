@@ -12,6 +12,15 @@ npm install -g github:profesr-chaos/marl
 
 Or from a local clone: `npm link`.
 
+## Setup
+
+```bash
+cd your-project
+marl init
+```
+
+Creates `.marl/`, appends the agent loop below to `CLAUDE.md` (or `AGENTS.md` if you have one), and registers a `SessionStart` hook in `.claude/settings.json` so `marl prime` runs automatically at the start of every session. Idempotent — re-running it changes nothing. `marl init --no-hook` skips the settings change.
+
 ## Usage
 
 ```bash
@@ -19,6 +28,7 @@ marl record db "Use WAL mode for SQLite" --type convention
 marl record api "Retry on 429 with backoff" --type pattern --tags http
 marl prime            # all knowledge, markdown — inject into agent context
 marl prime db         # one domain
+marl prime --limit 40 # cap the context cost; says what it omitted
 marl search sqlite    # find records
 marl confirm a1b2c3   # "I applied this and it was right" — boosts survival
 marl revise a1b2c3 "Use WAL mode except in CI"   # this record was wrong
@@ -26,23 +36,31 @@ marl drop a1b2c3 "moved to Postgres"             # no longer applies
 marl prune --days 90  # archive records nothing has confirmed in 90 days
 ```
 
-Ids accept any unambiguous prefix (`marl confirm a1b`). `revise` archives the old record and creates a replacement carrying its domain, type and tags but with confirms reset — corrected knowledge re-earns trust. Nothing is ever deleted; `revise`, `drop` and `prune` all append to `.marl/archive.jsonl` with a reason.
-
 Types: `convention`, `pattern`, `failure`, `decision`, `note`.
 
-The feedback loop: `confirm` stamps `last_used`; `prune` archives (never deletes — see `.marl/archive.jsonl`) whatever stops being confirmed. Knowledge that keeps proving itself keeps living. `prime` is a pure read — being printed is not evidence a record is useful, only that it exists.
+Ids accept any unambiguous prefix (`marl confirm a1b`). `revise` archives the old record and creates a replacement carrying its domain, type and tags but with confirms reset — corrected knowledge re-earns trust. Nothing is ever deleted: `revise`, `drop` and `prune` all append to `.marl/archive.jsonl` with a reason.
+
+`record` warns when a new record looks like one that already exists, and when it invents a domain that isn't already in use.
+
+## The feedback loop
+
+`confirm` stamps `last_used`; `prune` archives whatever stops being confirmed. Knowledge that keeps proving itself keeps living, and `prime` puts the most-confirmed records first so the strongest knowledge leads the context window.
+
+`prime` is a pure read. Being printed is not evidence a record is useful — only that it exists — so priming can't keep dead knowledge alive.
 
 ## Agent setup
 
-Add to your project's `CLAUDE.md` / `AGENTS.md`:
+`marl init` writes this block for you. To add it by hand:
 
-> **marl** — this project's knowledge store. Follow this loop:
+> ## marl — this project's knowledge store
 >
-> 1. **Session start:** run `marl prime` and treat the output as project ground truth.
-> 2. **Before recording:** run `marl search <keywords>` — if the fact already exists, `marl confirm <id>` instead of duplicating it.
-> 3. **Before finishing a task:** record non-obvious learnings with `marl record <domain> "<text>" --type <type>`.
-> 4. **When a primed record proves correct in practice:** run `marl confirm <id>`.
-> 5. **When committing:** include `.marl/` in the same commit as the change that produced the learning.
+> Run `marl prime` at session start and treat the output as project ground truth.
+>
+> - **Before recording:** `marl search <keywords>` — if the fact already exists, `marl confirm <id>` instead of duplicating it.
+> - **Before finishing a task:** record non-obvious learnings — `marl record <domain> "<text>" --type convention|pattern|failure|decision|note`.
+> - **When a primed record proves correct in practice:** `marl confirm <id>`. Confirm means "I applied this and it held", not "I read it" — confirming everything you prime destroys the signal that keeps knowledge alive.
+> - **When a primed record proves wrong:** `marl revise <id> "<corrected text>"`. Never record a contradicting fact alongside the old one. If it no longer applies at all, `marl drop <id> "<reason>"`.
+> - **When committing:** include `.marl/` in the same commit as the change that produced the learning.
 
 ### What to record
 
@@ -56,4 +74,6 @@ Domains are just labels — short, stable, lowercase: `db`, `api`, `auth`, `buil
 
 ### Output notes
 
-`marl prime` emits plain markdown grouped by domain, safe to inject directly into context. All commands exit non-zero on error. Records are JSONL in `.marl/knowledge.jsonl` — human-readable, git-diffable, hand-editable if needed.
+`marl prime` emits plain markdown grouped by domain, safe to inject directly into context; `--json` on `prime` and `search` gives raw records instead. All commands exit non-zero on error.
+
+Records are JSONL in `.marl/knowledge.jsonl` — human-readable, git-diffable, and hand-editable: malformed lines are reported by file and line number rather than crashing. Commands find `.marl` by walking up from the current directory, so they work from subdirectories.

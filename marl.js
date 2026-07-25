@@ -339,14 +339,24 @@ if (!cmd || !cmds[cmd]) {
   console.log(`marl — project knowledge for AI agents
 
 usage:
-  marl init [--no-hook]      set up .marl, agent instructions, session hook
+  marl init [--no-hook]
+      set up .marl, agent instructions, and a SessionStart prime hook
   marl record <domain> <text...> [--type ${TYPES.join("|")}] [--tags a,b]
-  marl prime [domain] [--limit n] [--json]   print knowledge, most-confirmed first
-  marl search <query...> [--json]      find records
-  marl confirm <id>          mark a record as applied and correct
-  marl revise <id> <text...> replace a record that turned out wrong
-  marl drop <id> [reason...] archive a record that no longer applies
-  marl prune [--days 90] [--dry-run]   archive records untouched for N days`);
+      record one fact; warns on near-duplicates and new domains
+  marl prime [domain] [--limit n] [--json]
+      print knowledge, most-confirmed first — inject into agent context
+  marl search <query...> [--json]
+      find records
+  marl confirm <id>
+      "I applied this and it held" — keeps the record alive
+  marl revise <id> <text...> [--type t] [--tags a,b]
+      replace a record that turned out wrong
+  marl drop <id> [reason...]
+      archive a record that no longer applies
+  marl prune [--days 90] [--dry-run]
+      archive records unconfirmed for N days
+
+ids accept any unambiguous prefix. nothing is deleted — see .marl/archive.jsonl`);
   process.exit(cmd ? 1 : 0);
 }
 cmds[cmd](rest);
