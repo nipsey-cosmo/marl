@@ -85,6 +85,21 @@ test("revise supersedes, drop archives", () => {
   assert.match(archived, /cache removed entirely/);
 });
 
+test("record warns on near-duplicates and new domains", () => {
+  marl("record", "http", "Retry on 429 with exponential backoff");
+
+  let r = marl("record", "http", "Retry on 429 using exponential backoff");
+  assert.match(r.out, /similar:/);
+  assert.match(r.out, /same fact\?/);
+  assert.doesNotMatch(r.out, /new domain/); // http already exists
+
+  r = marl("record", "http", "Timeouts are 30 seconds");
+  assert.doesNotMatch(r.out, /similar:/); // unrelated fact, same domain
+
+  r = marl("record", "htp", "Typo domain");
+  assert.match(r.out, /new domain "htp" — existing: .*http/);
+});
+
 test("errors exit non-zero", () => {
   assert.equal(marl("record", "db").code, 1);
   assert.equal(marl("record", "db", "x", "--type", "bogus").code, 1);

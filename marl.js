@@ -52,6 +52,24 @@ function find(records, id) {
   return prefixed[0];
 }
 
+// ponytail: shared-word overlap, not embeddings — a nudge for agents that skip `marl search`
+const words = (s) => new Set(s.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []);
+
+function similar(text, records) {
+  const a = words(text);
+  if (!a.size) return [];
+  return records
+    .map((r) => {
+      const b = words(r.text);
+      const shared = [...a].filter((w) => b.has(w)).length;
+      return { r, shared, overlap: shared / Math.min(a.size, b.size) };
+    })
+    .filter((h) => h.shared >= 2 && h.overlap >= 0.5)
+    .sort((x, y) => y.overlap - x.overlap)
+    .slice(0, 3)
+    .map((h) => h.r);
+}
+
 function archive(records, reason) {
   append(records.map((r) => ({ ...r, archived: new Date().toISOString(), reason })), ARCHIVE);
 }
@@ -72,8 +90,9 @@ const cmds = {
     const [domain, ...text] = positionals;
     if (!domain || text.length === 0) fail("usage: marl record <domain> <text...> [--type t] [--tags a,b]");
     if (!TYPES.includes(values.type)) fail(`type must be one of: ${TYPES.join(", ")}`);
+    const existing = load();
     const rec = {
-      id: newId(load()),
+      id: newId(existing),
       domain,
       type: values.type,
       text: text.join(" "),
@@ -85,6 +104,15 @@ const cmds = {
     // append, not read-modify-write: parallel agents recording at once must not lose records
     append([rec], FILE);
     console.log(`recorded [${rec.id}] in ${domain}`);
+
+    const dupes = similar(rec.text, existing);
+    for (const d of dupes) console.log(`  similar: ${d.domain} ${line(d)}`);
+    if (dupes.length) console.log(`  → same fact? marl drop ${rec.id} duplicate && marl confirm ${dupes[0].id}`);
+
+    const domains = [...new Set(existing.map((r) => r.domain))].sort();
+    if (domains.length && !domains.includes(domain)) {
+      console.log(`  new domain "${domain}" — existing: ${domains.join(", ")} (reuse one if it fits)`);
+    }
   },
 
   prime(args) {
