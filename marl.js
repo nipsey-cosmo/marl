@@ -6,16 +6,44 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-// ponytail: cwd-only, no upward .marl search like git — add if running from subdirs ever hurts
-const DIR = path.join(process.cwd(), ".marl");
+// walk up like git: an agent working in packages/api/ must find the project's store,
+// not silently start a second one there
+function findDir() {
+  for (let dir = process.cwd(); ; ) {
+    const candidate = path.join(dir, ".marl");
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return path.join(process.cwd(), ".marl"); // none anywhere: create here
+    dir = parent;
+  }
+}
+
+const DIR = findDir();
 const FILE = path.join(DIR, "knowledge.jsonl");
 const ARCHIVE = path.join(DIR, "archive.jsonl");
 
 const TYPES = ["convention", "pattern", "failure", "decision", "note"];
+const REQUIRED = ["id", "domain", "type", "text", "created"];
 
+// the file is documented as hand-editable, so treat it as untrusted input
 function load(file = FILE) {
   if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map(JSON.parse);
+  return fs
+    .readFileSync(file, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((raw, i) => {
+      let rec;
+      try {
+        rec = JSON.parse(raw);
+      } catch {
+        fail(`${file}:${i + 1} is not valid JSON — fix or delete the line`);
+      }
+      for (const key of REQUIRED) {
+        if (typeof rec[key] !== "string") fail(`${file}:${i + 1} is missing "${key}"`);
+      }
+      return { tags: [], confirms: 0, last_used: null, ...rec };
+    });
 }
 
 function save(records, file = FILE) {

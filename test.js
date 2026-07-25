@@ -115,6 +115,34 @@ test("prime ranks by confirms and reports what --limit omitted", () => {
   assert.equal(marl("prime", "--limit", "0").code, 1);
 });
 
+test("finds .marl from a subdirectory", () => {
+  const sub = path.join(cwd, "packages", "api");
+  fs.mkdirSync(sub, { recursive: true });
+  const res = spawnSync(process.execPath, [CLI, "prime", "db"], { cwd: sub, encoding: "utf8" });
+  assert.match(res.stdout, /WAL mode/); // parent store, not a new empty one
+  assert.ok(!fs.existsSync(path.join(sub, ".marl")));
+});
+
+test("survives hand-edited records", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-edit-"));
+  const file = path.join(dir, ".marl", "knowledge.jsonl");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const run = (...a) => spawnSync(process.execPath, [CLI, ...a], { cwd: dir, encoding: "utf8" });
+
+  // minimal record typed by hand: no tags, no confirms, no last_used
+  fs.writeFileSync(file, JSON.stringify({ id: "aaa111", domain: "db", type: "note", text: "Hand written", created: "2024-01-01T00:00:00.000Z" }) + "\n");
+  assert.match(run("prime").stdout, /Hand written/);
+  assert.equal(run("confirm", "aaa111").status, 0);
+
+  fs.appendFileSync(file, "{not json\n");
+  const bad = run("prime");
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /knowledge\.jsonl:2 is not valid JSON/);
+
+  fs.writeFileSync(file, JSON.stringify({ id: "bbb222", domain: "db" }) + "\n");
+  assert.match(run("prime").stderr, /missing "type"/);
+});
+
 test("errors exit non-zero", () => {
   assert.equal(marl("record", "db").code, 1);
   assert.equal(marl("record", "db", "x", "--type", "bogus").code, 1);
