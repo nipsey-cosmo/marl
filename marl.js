@@ -108,7 +108,14 @@ function line(r) {
   return `- [${r.id}] (${r.type}${badge}) ${r.text}${tags}`;
 }
 
-const AGENT_BLOCK = `## marl — this project's knowledge store
+const VERSION = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "package.json"), "utf8")).version;
+
+// markers so `marl init` can update its own block on upgrade instead of duplicating it
+const START = "<!-- marl:start -->";
+const END = "<!-- marl:end -->";
+
+const AGENT_BLOCK = `${START}
+## marl — this project's knowledge store
 
 Run \`marl prime\` at session start and treat the output as project ground truth.
 
@@ -121,6 +128,7 @@ Run \`marl prime\` at session start and treat the output as project ground truth
 One fact per record, written so a stranger can act on it without context: gotchas with their resolution (\`failure\`), choices with their reason (\`decision\`), "always do X here" rules (\`convention\`), reusable approaches (\`pattern\`). Do not record anything derivable by reading the code, session-specific state, secrets, or restatements of the task.
 
 Domains are short, stable, lowercase labels (\`db\`, \`api\`, \`auth\`, \`build\`). Reuse an existing one before inventing a new one.
+${END}
 `;
 
 const cmds = {
@@ -135,12 +143,23 @@ const cmds = {
     for (const name of targets.length ? targets : ["CLAUDE.md"]) {
       const file = path.join(process.cwd(), name);
       const current = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-      if (current.includes("marl prime")) {
-        console.log(`${name}: already documented`);
-        continue;
+      const from = current.indexOf(START);
+      const to = current.indexOf(END);
+      if (from !== -1 && to > from) {
+        const updated = current.slice(0, from) + AGENT_BLOCK.trimEnd() + current.slice(to + END.length);
+        if (updated === current) {
+          console.log(`${name}: instructions up to date`);
+          continue;
+        }
+        fs.writeFileSync(file, updated);
+        console.log(`${name}: updated agent instructions`);
+      } else if (current.includes("marl prime")) {
+        // pre-0.2.0 block, no markers — its bounds aren't knowable, so don't guess at them
+        console.log(`${name}: has unmarked marl instructions — delete them and re-run to get the current block`);
+      } else {
+        fs.writeFileSync(file, (current ? `${current.trimEnd()}\n\n` : "") + AGENT_BLOCK);
+        console.log(`${name}: added agent instructions`);
       }
-      fs.writeFileSync(file, (current ? `${current.trimEnd()}\n\n` : "") + AGENT_BLOCK);
-      console.log(`${name}: added agent instructions`);
     }
     if (values["no-hook"]) return;
 
@@ -335,8 +354,12 @@ const cmds = {
 };
 
 const [cmd, ...rest] = process.argv.slice(2);
+if (cmd === "--version" || cmd === "-v") {
+  console.log(VERSION);
+  process.exit(0);
+}
 if (!cmd || !cmds[cmd]) {
-  console.log(`marl — project knowledge for AI agents
+  console.log(`marl ${VERSION} — project knowledge for AI agents
 
 usage:
   marl init [--no-hook]

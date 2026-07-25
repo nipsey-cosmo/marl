@@ -10,7 +10,13 @@ Agents record learnings as they work; future sessions prime them back into conte
 npm install -g github:profesr-chaos/marl
 ```
 
-Or from a local clone: `npm link`.
+Or from a local clone: `npm link`. Pin a release with `#v0.2.0`; check what you have with `marl --version`.
+
+### Upgrading
+
+Re-run the install command — it re-resolves the branch and overwrites the global install. (`npm update -g marl` won't work: this is a git dependency, not a registry package. `npm link` users just `git pull`.) Then re-run `marl init` in each project to refresh the agent instructions in place.
+
+No migration is needed for existing `.marl` data. One behaviour change in 0.2.0: unconfirmed records now genuinely age out, so your first `prune` after upgrading may archive more than you expect — run it with `--dry-run` first.
 
 ## Setup
 
@@ -19,7 +25,9 @@ cd your-project
 marl init
 ```
 
-Creates `.marl/`, appends the agent loop below to `CLAUDE.md` (or `AGENTS.md` if you have one), and registers a `SessionStart` hook in `.claude/settings.json` so `marl prime` runs automatically at the start of every session. Idempotent — re-running it changes nothing. `marl init --no-hook` skips the settings change.
+Creates `.marl/`, appends the agent loop below to `CLAUDE.md` (or `AGENTS.md` if you have one), and registers a `SessionStart` hook in `.claude/settings.json` so `marl prime` runs automatically at the start of every session. `marl init --no-hook` skips the settings change.
+
+The block is fenced by `<!-- marl:start -->` / `<!-- marl:end -->` comments. Re-running `init` rewrites only what's between them, so upgrades refresh the instructions without touching the rest of your file — keep the markers. Instructions written before 0.2.0 have no markers; `init` reports them and leaves them alone rather than guessing where they end, so delete the old block and re-run.
 
 ## Usage
 

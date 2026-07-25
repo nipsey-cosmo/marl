@@ -162,9 +162,41 @@ test("init is idempotent and preserves existing settings", () => {
   assert.equal(settings.hooks.SessionStart[0].hooks[0].command, "marl prime");
 
   out = run().stdout;
-  assert.match(out, /already documented/);
+  assert.match(out, /instructions up to date/);
   assert.match(out, /already installed/);
   assert.equal(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8").match(/marl prime/g).length, 1);
+});
+
+test("init refreshes its own block, leaves the rest of the file alone", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-block-"));
+  const md = path.join(dir, "CLAUDE.md");
+  const run = () => spawnSync(process.execPath, [CLI, "init", "--no-hook"], { cwd: dir, encoding: "utf8" });
+
+  fs.writeFileSync(md, "# My project\n\nMy own notes.\n");
+  run();
+  let text = fs.readFileSync(md, "utf8");
+  assert.match(text, /My own notes/);
+  assert.match(text, /marl:start/);
+
+  // simulate an outdated block from a previous version
+  fs.writeFileSync(md, text.replace(/marl prime[\s\S]*?marl:end/, "OLD INSTRUCTIONS\n<!-- marl:end"));
+  assert.match(run().stdout, /updated agent instructions/);
+  text = fs.readFileSync(md, "utf8");
+  assert.doesNotMatch(text, /OLD INSTRUCTIONS/);
+  assert.match(text, /marl revise/);
+  assert.match(text, /My own notes/); // surrounding content preserved
+  assert.equal(text.match(/marl:start/g).length, 1);
+
+  // a pre-0.2.0 unmarked block is reported, never clobbered
+  fs.writeFileSync(md, "# My project\n\nRun `marl prime` at session start.\n");
+  assert.match(run().stdout, /unmarked marl instructions/);
+  assert.equal(fs.readFileSync(md, "utf8"), "# My project\n\nRun `marl prime` at session start.\n");
+});
+
+test("--version reports the package version", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, "package.json"), "utf8"));
+  assert.equal(marl("--version").out.trim(), pkg.version);
+  assert.match(marl("--help").out, new RegExp(`marl ${pkg.version}`));
 });
 
 test("--json emits parseable records", () => {
