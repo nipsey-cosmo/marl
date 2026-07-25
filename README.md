@@ -26,7 +26,7 @@ marl prune --days 90  # archive records nothing has touched in 90 days
 
 Types: `convention`, `pattern`, `failure`, `decision`, `note`.
 
-The feedback loop: `prime` and `confirm` stamp `last_used`; `prune` archives (never deletes — see `.marl/archive.jsonl`) whatever stops being touched. Knowledge that keeps getting used keeps living.
+The feedback loop: `confirm` stamps `last_used`; `prune` archives (never deletes — see `.marl/archive.jsonl`) whatever stops being confirmed. Knowledge that keeps proving itself keeps living. `prime` is a pure read — being printed is not evidence a record is useful, only that it exists.
 
 ## Agent setup
 

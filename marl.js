@@ -20,7 +20,10 @@ function load(file = FILE) {
 
 function save(records, file = FILE) {
   fs.mkdirSync(DIR, { recursive: true });
-  fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + (records.length ? "\n" : ""));
+  // atomic: a crash mid-write must not truncate the knowledge base
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, records.map((r) => JSON.stringify(r)).join("\n") + (records.length ? "\n" : ""));
+  fs.renameSync(tmp, file);
 }
 
 function append(records, file) {
@@ -59,7 +62,8 @@ const cmds = {
       last_used: null,
       confirms: 0,
     };
-    save([...load(), rec]);
+    // append, not read-modify-write: parallel agents recording at once must not lose records
+    append([rec], FILE);
     console.log(`recorded [${rec.id}] in ${domain}`);
   },
 
@@ -78,10 +82,8 @@ const cmds = {
       for (const r of records.filter((r) => r.domain === d)) console.log(line(r));
       console.log("");
     }
-    // feedback loop: primed = used. Prune keeps whatever keeps getting primed/confirmed.
-    const now = new Date().toISOString();
-    const emitted = new Set(records.map((r) => r.id));
-    save(load().map((r) => (emitted.has(r.id) ? { ...r, last_used: now } : r)));
+    // prime is a pure read: being printed is not evidence a record is useful, only that it
+    // exists. Stamping last_used here made every record immortal and prune a no-op.
   },
 
   search(args) {

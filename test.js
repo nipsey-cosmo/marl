@@ -50,6 +50,17 @@ test("record → prime → search → confirm → prune round trip", () => {
   assert.match(fs.readFileSync(path.join(cwd, ".marl", "archive.jsonl"), "utf8"), /Rate limit/);
 });
 
+test("prime does not rescue a stale record", () => {
+  const file = path.join(cwd, ".marl", "knowledge.jsonl");
+  marl("record", "stale", "Old fact");
+  const records = fs.readFileSync(file, "utf8").trim().split("\n").map(JSON.parse);
+  records.at(-1).created = "2020-01-01T00:00:00.000Z";
+  fs.writeFileSync(file, records.map((x) => JSON.stringify(x)).join("\n") + "\n");
+
+  marl("prime"); // must not stamp last_used — otherwise prune is a permanent no-op
+  assert.match(marl("prune", "--days", "30", "--dry-run").out, /would archive stale/);
+});
+
 test("errors exit non-zero", () => {
   assert.equal(marl("record", "db").code, 1);
   assert.equal(marl("record", "db", "x", "--type", "bogus").code, 1);
