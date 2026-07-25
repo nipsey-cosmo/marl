@@ -116,20 +116,37 @@ const cmds = {
   },
 
   prime(args) {
-    const [domain] = args;
+    const { values, positionals } = parseArgs({
+      args,
+      options: { limit: { type: "string" } },
+      allowPositionals: true,
+    });
+    const [domain] = positionals;
     let records = load();
     if (domain) records = records.filter((r) => r.domain === domain);
     if (records.length === 0) {
       console.log(domain ? `No knowledge for domain "${domain}".` : "No knowledge recorded yet. Use: marl record <domain> <text...>");
       return;
     }
+    // most-confirmed first: what survived contact with reality leads the context window
+    const byTrust = (a, b) => b.confirms - a.confirms || a.created.localeCompare(b.created);
+    let omitted = 0;
+    if (values.limit !== undefined) {
+      const n = Number(values.limit);
+      if (!Number.isFinite(n) || n <= 0) fail("--limit must be a positive number");
+      omitted = Math.max(0, records.length - n);
+      records = [...records].sort(byTrust).slice(0, n);
+    }
+
     console.log("# Project knowledge (.marl)\n");
     const domains = [...new Set(records.map((r) => r.domain))].sort();
     for (const d of domains) {
       console.log(`## ${d}`);
-      for (const r of records.filter((r) => r.domain === d)) console.log(line(r));
+      for (const r of records.filter((r) => r.domain === d).sort(byTrust)) console.log(line(r));
       console.log("");
     }
+    // no silent caps: a truncated prime that looks complete is worse than no prime
+    if (omitted) console.log(`_${omitted} less-confirmed record(s) omitted — raise --limit or prime one domain._`);
     // prime is a pure read: being printed is not evidence a record is useful, only that it
     // exists. Stamping last_used here made every record immortal and prune a no-op.
   },
@@ -229,7 +246,7 @@ if (!cmd || !cmds[cmd]) {
 
 usage:
   marl record <domain> <text...> [--type ${TYPES.join("|")}] [--tags a,b]
-  marl prime [domain]        print knowledge (touches last_used)
+  marl prime [domain] [--limit n]      print knowledge, most-confirmed first
   marl search <query...>     find records
   marl confirm <id>          mark a record as applied and correct
   marl revise <id> <text...> replace a record that turned out wrong

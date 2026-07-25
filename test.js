@@ -100,6 +100,21 @@ test("record warns on near-duplicates and new domains", () => {
   assert.match(r.out, /new domain "htp" — existing: .*http/);
 });
 
+test("prime ranks by confirms and reports what --limit omitted", () => {
+  const id = marl("record", "rank", "Proven fact").out.match(/\[(\w{6})\]/)[1];
+  marl("record", "rank", "Unproven fact");
+  marl("confirm", id);
+
+  let r = marl("prime", "rank");
+  assert.ok(r.out.indexOf("Proven") < r.out.indexOf("Unproven"), "confirmed record should lead");
+
+  r = marl("prime", "rank", "--limit", "1");
+  assert.match(r.out, /Proven/);
+  assert.doesNotMatch(r.out, /Unproven/);
+  assert.match(r.out, /1 less-confirmed record\(s\) omitted/);
+  assert.equal(marl("prime", "--limit", "0").code, 1);
+});
+
 test("errors exit non-zero", () => {
   assert.equal(marl("record", "db").code, 1);
   assert.equal(marl("record", "db", "x", "--type", "bogus").code, 1);
