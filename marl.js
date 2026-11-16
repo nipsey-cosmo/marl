@@ -5,6 +5,7 @@ import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 // walk up like git: an agent working in packages/api/ must find the project's store,
@@ -20,6 +21,7 @@ function findDir() {
 }
 
 const DIR = findDir();
+const ROOT = path.dirname(DIR); // project root: record paths are relative to it, git runs in it
 const FILE = path.join(DIR, "knowledge.jsonl");
 const ARCHIVE = path.join(DIR, "archive.jsonl");
 
@@ -43,7 +45,8 @@ function parse(file) {
       for (const key of REQUIRED) {
         if (typeof rec[key] !== "string") fail(`${file}:${i + 1} is missing "${key}"`);
       }
-      return { tags: [], confirms: 0, last_used: null, ...rec };
+      if (rec.paths !== undefined && !Array.isArray(rec.paths)) fail(`${file}:${i + 1} "paths" must be an array of globs`);
+      return { tags: [], paths: [], confirms: 0, last_used: null, ...rec };
     });
 }
 
@@ -85,9 +88,61 @@ function append(records, file) {
   fs.appendFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
 }
 
+// `marl hook` rides on the user's tool call and must never break it: there, an error is
+// thrown for the hook to swallow instead of ending the process with a message and exit 1
+let quiet = false;
+
 function fail(msg) {
+  if (quiet) throw new Error(msg);
   console.error(`marl: ${msg}`);
   process.exit(1);
+}
+
+const csv = (s) => (s ? s.split(",").map((t) => t.trim()).filter(Boolean) : []);
+const slash = (p) => p.replaceAll("\\", "/"); // Windows separators → the one form globs are written in
+
+// ponytail: no braces, negation or [classes] — `**` crosses "/", `*` and `?` stay inside a
+// segment, everything else is literal. Swap for path.matchesGlob when engines moves to >=22.
+function globRe(glob) {
+  const re = slash(glob).replace(/\*\*\/|\*\*|\*|\?|[.+^${}()|[\]]/g, (m) =>
+    // "**/" also matches zero directories: src/**/x.js must match src/x.js
+    m === "**/" ? "(?:.*/)?" : m === "**" ? ".*" : m === "*" ? "[^/]*" : m === "?" ? "[^/]" : `\\${m}`,
+  );
+  return new RegExp(`^${re}$`);
+}
+
+// does any glob of the record match any of these root-relative, "/"-separated files?
+const touches = (r, files) => r.paths.map(globRe).some((re) => files.some((f) => re.test(f)));
+
+// a file as given (absolute, or relative to cwd) → root-relative with "/" separators;
+// null when it lies outside the project, so that it matches nothing
+function rel(file) {
+  const r = slash(path.relative(ROOT, path.resolve(slash(file))));
+  return r === ".." || r.startsWith("../") || path.isAbsolute(r) ? null : r;
+}
+
+const matching = (records, files) => {
+  const rels = files.map(rel).filter(Boolean);
+  return records.filter((r) => touches(r, rels));
+};
+
+// every project file, root-relative: what git tracks or would track (so not ignored files),
+// or, outside a repo, a plain walk
+function projectFiles() {
+  try {
+    // -z: NUL-separated and unquoted, so odd file names arrive as they are
+    return execFileSync("git", ["-C", ROOT, "ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .split("\0")
+      .filter(Boolean);
+  } catch {
+    return fs
+      .readdirSync(ROOT, { recursive: true })
+      .map(slash)
+      .filter((f) => !/(^|\/)(\.git|node_modules)\//.test(f));
+  }
 }
 
 function newId(records) {
@@ -133,7 +188,7 @@ function archive(records, reason) {
 // commits on HEAD after a timestamp, or null when git can't say (no repo, no git, no HEAD)
 function commitsSince(iso) {
   try {
-    const out = execFileSync("git", ["-C", path.dirname(DIR), "rev-list", "--count", `--since=${iso}`, "HEAD"], {
+    const out = execFileSync("git", ["-C", ROOT, "rev-list", "--count", `--since=${iso}`, "HEAD"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"], // git's "not a git repository" is not the user's problem
     });
@@ -146,7 +201,8 @@ function commitsSince(iso) {
 function line(r) {
   const badge = r.confirms > 0 ? `, ×${r.confirms}` : "";
   const tags = r.tags?.length ? ` #${r.tags.join(" #")}` : "";
-  return `- [${r.id}] (${r.type}${badge}) ${r.text}${tags}`;
+  const paths = r.paths?.length ? ` @${r.paths.join(" @")}` : ""; // the scope, so a reader sees where it applies
+  return `- [${r.id}] (${r.type}${badge}) ${r.text}${tags}${paths}`;
 }
 
 const VERSION = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "package.json"), "utf8")).version;
@@ -163,7 +219,8 @@ const AGENT_BLOCK =`${START}
 Run \`marl prime\` at session start and treat the output as project ground truth.
 
 - **Before recording:** \`marl search <keywords>\` — if the fact already exists, \`marl confirm <id>\` instead of duplicating it.
-- **Before finishing a task:** record non-obvious learnings — \`marl record <domain> "<text>" --type ${TYPES.join("|")}\`.
+- **Before finishing a task:** record non-obvious learnings — \`marl record <domain> "<text>" --type ${TYPES.join("|")}\`. If the fact is about specific files, add \`--paths "src/db/**,migrations/*.sql"\`: it then shows up when those files are touched instead of in every session.
+- **Before editing an unfamiliar file:** \`marl for <file>\` prints the records scoped to it — skip this if a hook already hands them to you when you open the file.
 - **When a primed record proves correct in practice:** \`marl confirm <id>\`. Confirm means "I applied this and it held", not "I read it" — confirming everything you prime destroys the signal that keeps knowledge alive.
 - **When a primed record proves wrong:** \`marl revise <id> "<corrected text>"\`. Never record a contradicting fact alongside the old one. If it no longer applies at all, \`marl drop <id> "<reason>"\`.
 - **When committing:** include \`.marl/\` in the same commit as the change that produced the learning.
@@ -216,7 +273,12 @@ const cmds = {
     }
     if (values["no-hook"]) return;
 
-    // step 1 of the loop shouldn't depend on an agent remembering to run a command
+    // the loop shouldn't depend on an agent remembering to run a command: prime at session
+    // start, path-scoped records when a matching file is read or edited
+    const wanted = {
+      SessionStart: { hooks: [{ type: "command", command: "marl prime" }] },
+      PreToolUse: { matcher: "Read|Edit|Write", hooks: [{ type: "command", command: "marl hook" }] },
+    };
     const file = path.join(process.cwd(), ".claude", "settings.json");
     let settings = {};
     if (fs.existsSync(file)) {
@@ -227,25 +289,31 @@ const cmds = {
       }
     }
     settings.hooks ??= {};
-    settings.hooks.SessionStart ??= [];
-    if (JSON.stringify(settings.hooks.SessionStart).includes("marl prime")) {
-      console.log("hook: already installed");
-      return;
+    let changed = false;
+    for (const [event, entry] of Object.entries(wanted)) {
+      const { command } = entry.hooks[0];
+      const installed = (settings.hooks[event] ??= []);
+      if (JSON.stringify(installed).includes(command)) {
+        console.log(`hook: ${event} already installed`);
+        continue;
+      }
+      installed.push(entry);
+      changed = true;
+      console.log(`hook: ${event} → ${command} (${file})`);
     }
-    settings.hooks.SessionStart.push({ hooks: [{ type: "command", command: "marl prime" }] });
+    if (!changed) return;
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n");
-    console.log(`hook: SessionStart → marl prime (${file})`);
   },
 
   record(args) {
     const { values, positionals } = parseArgs({
       args,
-      options: { type: { type: "string", default: "note" }, tags: { type: "string" } },
+      options: { type: { type: "string", default: "note" }, tags: { type: "string" }, paths: { type: "string" } },
       allowPositionals: true,
     });
     const [domain, ...text] = positionals;
-    if (!domain || text.length === 0) fail("usage: marl record <domain> <text...> [--type t] [--tags a,b]");
+    if (!domain || text.length === 0) fail("usage: marl record <domain> <text...> [--type t] [--tags a,b] [--paths glob,glob]");
     if (!TYPES.includes(values.type)) fail(`type must be one of: ${TYPES.join(", ")}`);
     const existing = load();
     const rec = {
@@ -253,7 +321,8 @@ const cmds = {
       domain,
       type: values.type,
       text: text.join(" "),
-      tags: values.tags ? values.tags.split(",").map((t) => t.trim()).filter(Boolean) : [],
+      tags: csv(values.tags),
+      paths: csv(values.paths).map(slash),
       created: new Date().toISOString(),
       last_used: null,
       confirms: 0,
@@ -275,13 +344,18 @@ const cmds = {
   prime(args) {
     const { values, positionals } = parseArgs({
       args,
-      options: { limit: { type: "string" }, json: { type: "boolean", default: false } },
+      options: { limit: { type: "string" }, all: { type: "boolean", default: false }, json: { type: "boolean", default: false } },
       allowPositionals: true,
     });
     const [domain] = positionals;
     let records = load();
     if (domain) records = records.filter((r) => r.domain === domain);
-    if (records.length === 0) {
+    // a path-scoped record costs context in every session but matters only near its files, so
+    // markdown leaves it to `marl for` and the hook. --json is raw data: it keeps everything.
+    const total = records.length;
+    if (!values.all && !values.json) records = records.filter((r) => !r.paths.length);
+    const scoped = total - records.length;
+    if (total === 0) {
       if (values.json) return console.log("[]");
       console.log(domain ? `No knowledge for domain "${domain}".` : "No knowledge recorded yet. Use: marl record <domain> <text...>");
       return;
@@ -307,6 +381,7 @@ const cmds = {
     }
     // no silent caps: a truncated prime that looks complete is worse than no prime
     if (omitted) console.log(`_${omitted} less-confirmed record(s) omitted — raise --limit or prime one domain._`);
+    if (scoped) console.log(`_${scoped} path-scoped record(s) not shown — they appear when you touch matching files (marl for <file>, or marl prime --all)._`);
     // prime is a pure read: being printed is not evidence a record is useful, only that it
     // exists. Stamping last_used here made every record immortal and prune a no-op.
   },
@@ -335,14 +410,68 @@ const cmds = {
     for (const h of hits) console.log(`${h.r.domain} ${line(h.r)}`);
   },
 
+  for(args) {
+    const { values, positionals } = parseArgs({
+      args,
+      options: { json: { type: "boolean", default: false } },
+      allowPositionals: true,
+    });
+    if (positionals.length === 0) fail("usage: marl for <file...> [--json]");
+    const hits = matching(load(), positionals);
+    if (values.json) return console.log(JSON.stringify(hits));
+    // no match prints nothing: a hook or a script calls this, and silence is the answer
+    for (const r of hits) console.log(`${r.domain} ${line(r)}`);
+  },
+
+  // Claude Code PreToolUse hook: hook JSON on stdin, context for the model on stdout.
+  // The output carries no permissionDecision, so it takes no part in allowing the tool call.
+  hook() {
+    quiet = true;
+    try {
+      const input = JSON.parse(fs.readFileSync(0, "utf8"));
+      const file = input.tool_input.file_path;
+      let hits = matching(load(), [file]);
+      // once per session (per subagent: each has its own context) — the same record on every
+      // Read under src/db is noise. No session_id, no memory.
+      const session = input.session_id && `${input.session_id}-${input.agent_id ?? ""}`.replace(/[^A-Za-z0-9_-]/g, "");
+      if (session) {
+        // ponytail: no lock — parallel tool calls can show a record twice, never lose one.
+        // A context compaction also forgets what was shown; `marl for <file>` brings it back.
+        const seenFile = path.join(os.tmpdir(), `marl-${session}.json`);
+        const seen = fs.existsSync(seenFile) ? JSON.parse(fs.readFileSync(seenFile, "utf8")) : [];
+        hits = hits.filter((r) => !seen.includes(r.id));
+        if (hits.length) fs.writeFileSync(seenFile, JSON.stringify([...seen, ...hits.map((r) => r.id)]));
+      }
+      if (hits.length === 0) return;
+      const additionalContext = [`Project knowledge (.marl) for ${rel(file)}:`, ...hits.map(line)].join("\n");
+      console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: input.hook_event_name ?? "PreToolUse", additionalContext } }));
+    } catch {
+      // bad stdin, broken store, unwritable tmp: say nothing, exit 0
+    }
+  },
+
+  check(args) {
+    const { values } = parseArgs({ args, options: { json: { type: "boolean", default: false } } });
+    const files = projectFiles();
+    const orphans = load().filter((r) => r.paths.length && !touches(r, files));
+    if (values.json) return console.log(JSON.stringify(orphans));
+    if (orphans.length === 0) {
+      console.log("Nothing orphaned.");
+      return;
+    }
+    // read-only: a moved directory doesn't make a fact wrong, so whoever reads this decides
+    for (const r of orphans) console.log(`orphaned ${r.domain} ${line(r)}`);
+    console.log('→ still true? marl revise <id> ... --paths <new>; gone? marl drop <id> "<reason>"');
+  },
+
   revise(args) {
     const { values, positionals } = parseArgs({
       args,
-      options: { type: { type: "string" }, tags: { type: "string" } },
+      options: { type: { type: "string" }, tags: { type: "string" }, paths: { type: "string" } },
       allowPositionals: true,
     });
     const [id, ...text] = positionals;
-    if (!id || text.length === 0) fail("usage: marl revise <id> <text...> [--type t] [--tags a,b]");
+    if (!id || text.length === 0) fail("usage: marl revise <id> <text...> [--type t] [--tags a,b] [--paths glob,glob]");
     if (values.type && !TYPES.includes(values.type)) fail(`type must be one of: ${TYPES.join(", ")}`);
     const records = load();
     const old = find(records, id);
@@ -351,7 +480,8 @@ const cmds = {
       id: newId(records),
       type: values.type ?? old.type,
       text: text.join(" "),
-      tags: values.tags ? values.tags.split(",").map((t) => t.trim()).filter(Boolean) : old.tags,
+      tags: values.tags ? csv(values.tags) : old.tags,
+      paths: values.paths === undefined ? old.paths : csv(values.paths).map(slash), // --paths "" unscopes
       created: new Date().toISOString(),
       last_used: null,
       confirms: 0, // corrected knowledge earns trust again from scratch
@@ -434,23 +564,31 @@ if (!cmd || !cmds[cmd]) {
 
 usage:
   marl init [--no-hook]
-      set up .marl, agent instructions, and a SessionStart prime hook
-  marl record <domain> <text...> [--type ${TYPES.join("|")}] [--tags a,b]
-      record one fact; warns on near-duplicates and new domains
-  marl prime [domain] [--limit n] [--json]
-      print knowledge, most-confirmed first — inject into agent context
+      set up .marl, agent instructions, and the Claude Code hooks (prime at session start, hook on file access)
+  marl record <domain> <text...> [--type ${TYPES.join("|")}] [--tags a,b] [--paths "src/db/**,migrations/*.sql"]
+      record one fact; --paths scopes it to matching files; warns on near-duplicates and new domains
+  marl prime [domain] [--limit n] [--all] [--json]
+      print knowledge, most-confirmed first — inject into agent context.
+      path-scoped records are left out (and counted) unless --all or --json
   marl search <query...> [--json]
       find records
+  marl for <file...> [--json]
+      print the path-scoped records whose globs match these files; silent when none do
+  marl hook
+      Claude Code PreToolUse hook: hook JSON on stdin → matching records as context, once per session
+  marl check [--json]
+      list path-scoped records whose globs match no project file (read-only)
   marl confirm <id>
       "I applied this and it held" — keeps the record alive
-  marl revise <id> <text...> [--type t] [--tags a,b]
-      replace a record that turned out wrong
+  marl revise <id> <text...> [--type t] [--tags a,b] [--paths glob,glob]
+      replace a record that turned out wrong; type, tags and paths carry over unless given
   marl drop <id> [reason...]
       archive a record that no longer applies
   marl prune [--days 90] [--commits 10] [--dry-run]
       archive records unconfirmed for N days AND N commits (days only outside git, or --commits 0)
 
-ids accept any unambiguous prefix. nothing is deleted — see .marl/archive.jsonl`);
+ids accept any unambiguous prefix. globs: ** crosses directories, * and ? stay within one;
+paths are relative to the directory that holds .marl. nothing is deleted — see .marl/archive.jsonl`);
   process.exit(cmd ? 1 : 0);
 }
 cmds[cmd](rest);

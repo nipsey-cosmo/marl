@@ -1,6 +1,6 @@
 {
   "name": "marl",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Minimal project knowledge store for AI agents — record learnings, prime context, confirm what works",
   "type": "module",
   "bin": {
