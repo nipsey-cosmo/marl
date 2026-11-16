@@ -26,7 +26,7 @@ const TYPES = ["convention", "pattern", "failure", "decision", "note"];
 const REQUIRED = ["id", "domain", "type", "text", "created"];
 
 // the file is documented as hand-editable, so treat it as untrusted input
-function load(file = FILE) {
+function parse(file) {
   if (!fs.existsSync(file)) return [];
   return fs
     .readFileSync(file, "utf8")
@@ -46,6 +46,31 @@ function load(file = FILE) {
     });
 }
 
+// The active store. `.marl/.gitattributes` makes git union-merge the jsonl files, which
+// keeps both sides' lines — so the same id can appear twice (both branches confirmed it),
+// and a record one branch archived can come back from a branch that confirmed it.
+function load() {
+  // archive wins over a resurrected line; safe because revise gives the replacement a new id
+  const archived = new Set(parse(ARCHIVE).map((r) => r.id));
+  const byId = new Map(); // a Map keeps first-seen order when a key is re-set
+  for (const r of parse(FILE)) {
+    if (archived.has(r.id)) continue;
+    const seen = byId.get(r.id);
+    if (!seen) {
+      byId.set(r.id, r);
+      continue;
+    }
+    // ponytail: two branches that each confirmed once merge to max (×1), not sum (×2) —
+    // an append-only event log of confirms would fix it if the count ever matters
+    const last_used = [seen.last_used, r.last_used].filter(Boolean).sort().at(-1) ?? null;
+    byId.set(r.id, { ...(r.confirms > seen.confirms ? r : seen), last_used });
+  }
+  return [...byId.values()];
+}
+
+// ponytail: no locking — every caller is load → change → save, so a parallel `marl record`
+// in the same checkout that appends between the load and this rename loses its line.
+// Upgrade path: a lock file, or make the store an append-only event log.
 function save(records, file = FILE) {
   fs.mkdirSync(DIR, { recursive: true });
   // atomic: a crash mid-write must not truncate the knowledge base
@@ -65,9 +90,11 @@ function fail(msg) {
 }
 
 function newId(records) {
+  // archived ids are taken too: load() hides any active record whose id is in the archive
+  const taken = new Set([...records, ...parse(ARCHIVE)].map((r) => r.id));
   let id;
   do id = randomBytes(3).toString("hex");
-  while (records.some((r) => r.id === id));
+  while (taken.has(id));
   return id;
 }
 
@@ -114,7 +141,9 @@ const VERSION = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "packa
 const START = "<!-- marl:start -->";
 const END = "<!-- marl:end -->";
 
-const AGENT_BLOCK = `${START}
+const UNION = "*.jsonl merge=union";
+
+const AGENT_BLOCK =`${START}
 ## marl — this project's knowledge store
 
 Run \`marl prime\` at session start and treat the output as project ground truth.
@@ -138,6 +167,16 @@ const cmds = {
     if (fs.existsSync(DIR) && DIR !== here) console.log(`note: existing store at ${DIR} — this creates a separate one`);
     fs.mkdirSync(here, { recursive: true });
     console.log(`store: ${here}`);
+
+    // union merge: two branches that each append a record must not conflict on merge
+    const attrs = path.join(here, ".gitattributes");
+    const had = fs.existsSync(attrs) ? fs.readFileSync(attrs, "utf8") : "";
+    if (had.split(/\r?\n/).includes(UNION)) {
+      console.log("gitattributes: up to date");
+    } else {
+      fs.writeFileSync(attrs, (had && !had.endsWith("\n") ? `${had}\n` : had) + `${UNION}\n`);
+      console.log(`gitattributes: ${UNION} (${attrs})`);
+    }
 
     const targets = ["CLAUDE.md", "AGENTS.md"].filter((f) => fs.existsSync(path.join(process.cwd(), f)));
     for (const name of targets.length ? targets : ["CLAUDE.md"]) {

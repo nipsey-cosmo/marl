@@ -193,6 +193,115 @@ test("init refreshes its own block, leaves the rest of the file alone", () => {
   assert.equal(fs.readFileSync(md, "utf8"), "# My project\n\nRun `marl prime` at session start.\n");
 });
 
+test("init writes a union-merge .gitattributes, once, even with --no-hook", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-attr-"));
+  const run = () => spawnSync(process.execPath, [CLI, "init", "--no-hook"], { cwd: dir, encoding: "utf8" });
+  const attrs = path.join(dir, ".marl", ".gitattributes");
+
+  assert.match(run().stdout, /gitattributes: \*\.jsonl merge=union/);
+  assert.equal(fs.readFileSync(attrs, "utf8"), "*.jsonl merge=union\n");
+  assert.match(run().stdout, /gitattributes: up to date/);
+  assert.equal(fs.readFileSync(attrs, "utf8"), "*.jsonl merge=union\n");
+
+  // someone else's attributes are kept
+  fs.writeFileSync(attrs, "*.md text");
+  run();
+  assert.equal(fs.readFileSync(attrs, "utf8"), "*.md text\n*.jsonl merge=union\n");
+});
+
+// a store written by hand, the way a union merge leaves it
+function handStore(knowledge, archived) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-merge-"));
+  const jsonl = (records) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+  fs.mkdirSync(path.join(dir, ".marl"));
+  fs.writeFileSync(path.join(dir, ".marl", "knowledge.jsonl"), jsonl(knowledge));
+  if (archived) fs.writeFileSync(path.join(dir, ".marl", "archive.jsonl"), jsonl(archived));
+  const run = (...a) => spawnSync(process.execPath, [CLI, ...a], { cwd: dir, encoding: "utf8" });
+  return Object.assign(run, { file: path.join(dir, ".marl", "knowledge.jsonl") });
+}
+const rec =(id, text, extra = {}) => ({ id, domain: "db", type: "note", text, created: "2024-01-01T00:00:00.000Z", ...extra });
+
+test("duplicate ids collapse to one record: max confirms, latest last_used", () => {
+  const run = handStore([
+    rec("aaa111", "Twice confirmed", { confirms: 1, last_used: "2024-03-01T00:00:00.000Z" }),
+    rec("bbb222", "Other fact"),
+    rec("aaa111", "Twice confirmed", { confirms: 3, last_used: "2024-02-01T00:00:00.000Z" }),
+    rec("aaa111", "Twice confirmed", { confirms: 0, last_used: null }),
+  ]); // no archive.jsonl at all — must not crash
+
+  const res = run("prime", "--json");
+  assert.equal(res.status, 0);
+  const records = JSON.parse(res.stdout);
+  assert.equal(records.length, 2);
+  assert.equal(records[0].id, "aaa111");
+  assert.equal(records[0].confirms, 3);
+  assert.equal(records[0].last_used, "2024-03-01T00:00:00.000Z");
+
+  // a rewrite keeps first-seen order and leaves one line per id
+  assert.match(run("confirm", "aaa111").stdout, /×4/);
+  const lines = fs.readFileSync(run.file, "utf8").trim().split("\n");
+  assert.deepEqual(lines.map((l) => JSON.parse(l).id), ["aaa111", "bbb222"]);
+});
+
+test("an id in archive.jsonl stays archived even if knowledge.jsonl still has it", () => {
+  const dropped = rec("ccc333", "Dropped on one branch", { confirms: 2 });
+  const run = handStore(
+    [dropped, rec("ddd444", "Still alive")],
+    // the archive may hold the same id twice after a union merge — harmless
+    [{ ...dropped, archived: "2024-05-01T00:00:00.000Z", reason: "dropped" }, { ...dropped, archived: "2024-05-02T00:00:00.000Z", reason: "dropped" }],
+  );
+
+  const out = run("prime").stdout;
+  assert.doesNotMatch(out, /Dropped on one branch/);
+  assert.match(out, /Still alive/);
+  assert.doesNotMatch(run("search", "dropped").stdout, /ccc333/);
+  assert.equal(run("confirm", "ccc333").status, 1); // gone means gone
+});
+
+const hasGit = spawnSync("git", ["--version"]).status === 0;
+
+test("two branches that record and confirm merge without conflict", { skip: hasGit ? false : "git not on PATH" }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-git-"));
+  const run = (...a) => spawnSync(process.execPath, [CLI, ...a], { cwd: dir, encoding: "utf8" });
+  const git = (...a) => spawnSync("git", ["-C", dir, ...a], { encoding: "utf8" });
+  const ok = (res) => (assert.equal(res.status, 0, res.stdout + res.stderr), res);
+  const commit = (msg) => (ok(git("add", "-A")), ok(git("commit", "-m", msg)));
+
+  ok(git("init"));
+  ok(git("config", "user.name", "marl test"));
+  ok(git("config", "user.email", "marl@example.invalid"));
+  ok(git("config", "commit.gpgsign", "false")); // a signing setup on the host must not break the test
+  fs.writeFileSync(path.join(dir, "README.md"), "# repo\n");
+  commit("initial");
+
+  ok(run("init", "--no-hook"));
+  const base = ok(run("record", "db", "Base fact everyone shares")).stdout.match(/\[(\w{6})\]/)[1];
+  commit("marl: base record");
+  const baseSha = ok(git("rev-parse", "HEAD")).stdout.trim();
+
+  ok(git("checkout", "-b", "branch-a"));
+  ok(run("record", "api", "Learned on branch A"));
+  ok(run("confirm", base));
+  commit("branch a");
+
+  ok(git("checkout", "-b", "branch-b", baseSha));
+  ok(run("record", "build", "Learned on branch B"));
+  ok(run("confirm", base));
+  commit("branch b");
+
+  ok(git("checkout", "branch-a"));
+  const merge = git("merge", "--no-edit", "branch-b");
+  assert.equal(merge.status, 0, merge.stdout + merge.stderr);
+  assert.doesNotMatch(merge.stdout + merge.stderr, /CONFLICT/);
+  assert.equal(ok(git("status", "--porcelain")).stdout, "");
+
+  const prime = ok(run("prime")).stdout;
+  assert.equal(prime.match(/Base fact everyone shares/g).length, 1);
+  assert.match(prime, /Learned on branch A/);
+  assert.match(prime, /Learned on branch B/);
+  assert.equal(JSON.parse(run("prime", "--json").stdout).length, 3);
+});
+
 test("--version reports the package version", () => {
   const pkg = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, "package.json"), "utf8"));
   assert.equal(marl("--version").out.trim(), pkg.version);

@@ -25,7 +25,7 @@ cd your-project
 marl init
 ```
 
-Creates `.marl/`, appends the agent loop below to `CLAUDE.md` (or `AGENTS.md` if you have one), and registers a `SessionStart` hook in `.claude/settings.json` so `marl prime` runs automatically at the start of every session. `marl init --no-hook` skips the settings change.
+Creates `.marl/` (with a `.gitattributes` that union-merges the store — see [Branches and merges](#branches-and-merges)), appends the agent loop below to `CLAUDE.md` (or `AGENTS.md` if you have one), and registers a `SessionStart` hook in `.claude/settings.json` so `marl prime` runs automatically at the start of every session. `marl init --no-hook` skips the settings change.
 
 The block is fenced by `<!-- marl:start -->` / `<!-- marl:end -->` comments. Re-running `init` rewrites only what's between them, so upgrades refresh the instructions without touching the rest of your file — keep the markers. Instructions written before 0.2.0 have no markers; `init` reports them and leaves them alone rather than guessing where they end, so delete the old block and re-run.
 
@@ -55,6 +55,14 @@ Ids accept any unambiguous prefix (`marl confirm a1b`). `revise` archives the ol
 `confirm` stamps `last_used`; `prune` archives whatever stops being confirmed. Knowledge that keeps proving itself keeps living, and `prime` puts the most-confirmed records first so the strongest knowledge leads the context window.
 
 `prime` is a pure read. Being printed is not evidence a record is useful — only that it exists — so priming can't keep dead knowledge alive.
+
+## Branches and merges
+
+`marl init` writes `.marl/.gitattributes` containing `*.jsonl merge=union`, so branches that each record or confirm merge without conflicts: git keeps both sides' lines. Commit that file. marl reads the result sensibly — an id that appears on several lines collapses to one record (highest `confirms`, latest `last_used`), and an id present in `archive.jsonl` stays archived even if another branch's copy of it came back in the merge. Two branches that each confirmed the same record once merge to ×1, not ×2.
+
+Existing projects: re-run `marl init` to get the file.
+
+There is no file locking. Parallel `record`s are safe (they append), but a `record` that lands while another process in the same checkout is mid-`confirm`/`revise`/`drop`/`prune` can be lost.
 
 ## Agent setup
 
