@@ -41,7 +41,7 @@ marl search sqlite    # find records
 marl confirm a1b2c3   # "I applied this and it was right" — boosts survival
 marl revise a1b2c3 "Use WAL mode except in CI"   # this record was wrong
 marl drop a1b2c3 "moved to Postgres"             # no longer applies
-marl prune --days 90  # archive records nothing has confirmed in 90 days
+marl prune --days 90  # archive records nothing has confirmed in 90 days and 10 commits
 ```
 
 Types: `convention`, `pattern`, `failure`, `decision`, `note`.
@@ -53,6 +53,8 @@ Ids accept any unambiguous prefix (`marl confirm a1b`). `revise` archives the ol
 ## The feedback loop
 
 `confirm` stamps `last_used`; `prune` archives whatever stops being confirmed. Knowledge that keeps proving itself keeps living, and `prime` puts the most-confirmed records first so the strongest knowledge leads the context window.
+
+Decay follows project activity, not just the calendar: `prune` archives a record only if it is older than `--days` (default 90) **and** at least `--commits` (default 10) commits have landed on `HEAD` since it was last confirmed (or created). A project left idle for four months keeps its knowledge — nothing happened that could have proved it wrong. Outside a git repo, or if git isn't available, only the days rule applies; `--commits 0` asks for that explicitly.
 
 `prime` is a pure read. Being printed is not evidence a record is useful — only that it exists — so priming can't keep dead knowledge alive.
 

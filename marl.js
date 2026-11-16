@@ -3,6 +3,7 @@
 // Records live in .marl/knowledge.jsonl, one JSON object per line.
 import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -127,6 +128,19 @@ function similar(text, records) {
 
 function archive(records, reason) {
   append(records.map((r) => ({ ...r, archived: new Date().toISOString(), reason })), ARCHIVE);
+}
+
+// commits on HEAD after a timestamp, or null when git can't say (no repo, no git, no HEAD)
+function commitsSince(iso) {
+  try {
+    const out = execFileSync("git", ["-C", path.dirname(DIR), "rev-list", "--count", `--since=${iso}`, "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"], // git's "not a git repository" is not the user's problem
+    });
+    return /^\d+\s*$/.test(out) ? Number(out) : null;
+  } catch {
+    return null;
+  }
 }
 
 function line(r) {
@@ -372,13 +386,31 @@ const cmds = {
   prune(args) {
     const { values } = parseArgs({
       args,
-      options: { days: { type: "string", default: "90" }, "dry-run": { type: "boolean", default: false } },
+      options: {
+        days: { type: "string", default: "90" },
+        commits: { type: "string", default: "10" },
+        "dry-run": { type: "boolean", default: false },
+      },
     });
     const days = Number(values.days);
     if (!Number.isFinite(days) || days <= 0) fail("--days must be a positive number");
+    if (!/^\d+$/.test(values.commits)) fail("--commits must be a non-negative integer");
+    const minCommits = Number(values.commits);
     const cutoff = Date.now() - days * 86400000;
     const records = load();
-    const stale = records.filter((r) => new Date(r.last_used ?? r.created).getTime() < cutoff);
+    // wall time alone archives everything in a project that merely sat idle; a record is only
+    // stale if the project also moved on without anyone confirming it
+    let useGit = minCommits > 0;
+    const reasons = new Map();
+    const stale = records.filter((r) => {
+      const at = new Date(r.last_used ?? r.created);
+      if (!(at.getTime() < cutoff)) return false;
+      const n = useGit ? commitsSince(at.toISOString()) : null;
+      if (n === null) useGit = false; // git can't answer here: days-only, and don't ask again
+      else if (n < minCommits) return false;
+      reasons.set(r.id, `unconfirmed for ${days} days` + (n === null ? "" : ` and ${n} commits`));
+      return true;
+    });
     if (stale.length === 0) {
       console.log("Nothing stale.");
       return;
@@ -386,7 +418,7 @@ const cmds = {
     for (const r of stale) console.log(`${values["dry-run"] ? "would archive" : "archived"} ${r.domain} ${line(r)}`);
     if (!values["dry-run"]) {
       const staleIds = new Set(stale.map((r) => r.id));
-      archive(stale, `unconfirmed for ${days} days`);
+      for (const r of stale) archive([r], reasons.get(r.id));
       save(records.filter((r) => !staleIds.has(r.id)));
     }
   },
@@ -415,8 +447,8 @@ usage:
       replace a record that turned out wrong
   marl drop <id> [reason...]
       archive a record that no longer applies
-  marl prune [--days 90] [--dry-run]
-      archive records unconfirmed for N days
+  marl prune [--days 90] [--commits 10] [--dry-run]
+      archive records unconfirmed for N days AND N commits (days only outside git, or --commits 0)
 
 ids accept any unambiguous prefix. nothing is deleted — see .marl/archive.jsonl`);
   process.exit(cmd ? 1 : 0);

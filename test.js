@@ -7,9 +7,12 @@ import path from "node:path";
 
 const CLI = path.resolve(import.meta.dirname, "marl.js");
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "marl-test-"));
+// prune asks git about the project; if the temp dir happens to sit inside someone's repo,
+// stop git discovering it so these tests always exercise the outside-a-repo path
+const env = { ...process.env, GIT_CEILING_DIRECTORIES: os.tmpdir() };
 
 function marl(...args) {
-  const res = spawnSync(process.execPath, [CLI, ...args], { cwd, encoding: "utf8" });
+  const res = spawnSync(process.execPath, [CLI, ...args], { cwd, env, encoding: "utf8" });
   return { out: res.stdout + res.stderr, code: res.status };
 }
 
@@ -216,7 +219,7 @@ function handStore(knowledge, archived) {
   fs.mkdirSync(path.join(dir, ".marl"));
   fs.writeFileSync(path.join(dir, ".marl", "knowledge.jsonl"), jsonl(knowledge));
   if (archived) fs.writeFileSync(path.join(dir, ".marl", "archive.jsonl"), jsonl(archived));
-  const run = (...a) => spawnSync(process.execPath, [CLI, ...a], { cwd: dir, encoding: "utf8" });
+  const run = (...a) => spawnSync(process.execPath, [CLI, ...a], { cwd: dir, env, encoding: "utf8" });
   return Object.assign(run, { file: path.join(dir, ".marl", "knowledge.jsonl") });
 }
 const rec =(id, text, extra = {}) => ({ id, domain: "db", type: "note", text, created: "2024-01-01T00:00:00.000Z", ...extra });
@@ -302,6 +305,63 @@ test("two branches that record and confirm merge without conflict", { skip: hasG
   assert.equal(JSON.parse(run("prime", "--json").stdout).length, 3);
 });
 
+test("prune needs commits as well as days inside a git repo", { skip: hasGit ? false : "git not on PATH" }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marl-decay-"));
+  const run = (...a) => spawnSync(process.execPath, [CLI, ...a], { cwd: dir, encoding: "utf8" });
+  const ok = (res) => (assert.equal(res.status, 0, res.stdout + res.stderr), res);
+  const git = (...a) => ok(spawnSync("git", ["-C", dir, ...a], { encoding: "utf8" }));
+  // no date commits "now"; otherwise both author and committer date are forced
+  const commit = (date) =>
+    ok(spawnSync("git", ["-C", dir, "commit", "--allow-empty", "-m", "work"], {
+      encoding: "utf8",
+      env: date ? { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } : process.env,
+    }));
+  const prune = (...a) => ok(run("prune", "--days", "30", ...a)).stdout;
+
+  git("init");
+  git("config", "user.name", "marl test");
+  git("config", "user.email", "marl@example.invalid");
+  git("config", "commit.gpgsign", "false");
+
+  fs.mkdirSync(path.join(dir, ".marl"));
+  const store = path.join(dir, ".marl", "knowledge.jsonl");
+  const archiveFile = path.join(dir, ".marl", "archive.jsonl");
+  const old = (id, text) => JSON.stringify(rec(id, text, { created: "2020-01-01T00:00:00.000Z" })) + "\n";
+  fs.writeFileSync(store, old("eee555", "Idle project fact"));
+
+  // zero commits: --commits 0 is days-only, and must not need git to answer
+  assert.match(prune("--commits", "0", "--dry-run"), /would archive db/);
+
+  // commits from before the record don't count against it
+  commit("2019-06-01T00:00:00Z");
+  commit("2019-06-02T00:00:00Z");
+  assert.match(prune("--commits", "2"), /Nothing stale/);
+
+  commit(); // one commit after it: still fewer than --commits
+  assert.match(prune("--commits", "2"), /Nothing stale/);
+  assert.match(prune(), /Nothing stale/); // default is 10
+  assert.ok(!fs.existsSync(archiveFile));
+
+  commit();
+  assert.match(prune("--commits", "2"), /archived db/);
+  assert.match(fs.readFileSync(archiveFile, "utf8"), /"reason":"unconfirmed for 30 days and 2 commits"/);
+  assert.doesNotMatch(run("prime").stdout, /Idle project fact/);
+
+  // --commits 0 for real: archives with the days-only wording
+  fs.writeFileSync(store, old("fff666", "Second idle fact"));
+  assert.match(prune("--commits", "0"), /archived db/);
+  assert.match(fs.readFileSync(archiveFile, "utf8"), /"reason":"unconfirmed for 30 days"/);
+});
+
+test("prune outside a git repo is days-only and keeps git quiet", () => {
+  const run = handStore([rec("abc123", "No repo here", { created: "2020-01-01T00:00:00.000Z" })]);
+  const res = run("prune", "--days", "30", "--commits", "2");
+  assert.equal(res.status, 0);
+  assert.match(res.stdout, /archived db/);
+  assert.equal(res.stderr, ""); // no "fatal: not a git repository"
+  assert.match(fs.readFileSync(path.join(path.dirname(run.file), "archive.jsonl"), "utf8"), /"reason":"unconfirmed for 30 days"/);
+});
+
 test("--version reports the package version", () => {
   const pkg = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, "package.json"), "utf8"));
   assert.equal(marl("--version").out.trim(), pkg.version);
@@ -324,4 +384,9 @@ test("errors exit non-zero", () => {
   assert.equal(marl("revise", "nope00", "x").code, 1);
   assert.equal(marl("drop").code, 1);
   assert.equal(marl("frobnicate").code, 1);
+  for (const bad of ["1.5", "abc", "", "-1"]) {
+    const r = marl("prune", `--commits=${bad}`);
+    assert.equal(r.code, 1, `--commits "${bad}"`);
+    assert.match(r.out, /--commits must be a non-negative integer/);
+  }
 });
