@@ -50,6 +50,9 @@ function parse(file) {
     });
 }
 
+// what a record says, as opposed to how often it was confirmed
+const fact = (r) => JSON.stringify([r.domain, r.type, r.text, r.tags, r.paths]);
+
 // The active store. `.marl/.gitattributes` makes git union-merge the jsonl files, which
 // keeps both sides' lines — so the same id can appear twice (both branches confirmed it),
 // and a record one branch archived can come back from a branch that confirmed it.
@@ -64,6 +67,9 @@ function load() {
       byId.set(r.id, r);
       continue;
     }
+    // same id, different fact (a hand edit on one branch, or two branches minting the same id):
+    // picking one here would let the next save() erase the other without archiving it
+    if (fact(r) !== fact(seen)) fail(`${FILE} has two different records with id "${r.id}" — keep one line, or give one a new id`);
     // ponytail: two branches that each confirmed once merge to max (×1), not sum (×2) —
     // an append-only event log of confirms would fix it if the count ever matters
     const last_used = [seen.last_used, r.last_used].filter(Boolean).sort().at(-1) ?? null;
@@ -85,7 +91,11 @@ function save(records, file = FILE) {
 
 function append(records, file) {
   fs.mkdirSync(DIR, { recursive: true });
-  fs.appendFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  // a hand edit, or a union merge of one, can leave the last line without its newline: don't glue
+  // onto it. ponytail: reads the whole file for its last byte (every caller has just load()ed it
+  // anyway) — read one byte at size-1 if stores ever get big.
+  const had = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+  fs.appendFileSync(file, (had && !had.endsWith("\n") ? "\n" : "") + records.map((r) => JSON.stringify(r)).join("\n") + "\n");
 }
 
 // `marl hook` rides on the user's tool call and must never break it: there, an error is
@@ -121,6 +131,18 @@ function rel(file) {
   return r === ".." || r.startsWith("../") || path.isAbsolute(r) ? null : r;
 }
 
+// --paths as typed → globs as stored: root-relative, and a directory means everything under it.
+// Stored as typed, "./src/db/**", "src/db/" or an absolute path would match no file, and the
+// record would leave prime without ever showing up anywhere else.
+function globs(s) {
+  return csv(s).map((p) => {
+    const abs = path.resolve(ROOT, slash(p));
+    const glob = rel(abs) ?? fail(`--paths "${p}" is outside the project (${ROOT})`);
+    const dir = /[\\/]$/.test(p) || (fs.existsSync(abs) && fs.statSync(abs).isDirectory());
+    return dir ? (glob ? `${glob}/**` : "**") : glob;
+  });
+}
+
 const matching = (records, files) => {
   const rels = files.map(rel).filter(Boolean);
   return records.filter((r) => touches(r, rels));
@@ -134,13 +156,15 @@ function projectFiles() {
     return execFileSync("git", ["-C", ROOT, "ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: Infinity, // the 1 MiB default throws on a big repo, and a throw here means "no repo"
     })
       .split("\0")
       .filter(Boolean);
   } catch {
     return fs
-      .readdirSync(ROOT, { recursive: true })
-      .map(slash)
+      .readdirSync(ROOT, { recursive: true, withFileTypes: true })
+      .filter((d) => !d.isDirectory()) // as in git: a directory is not a file, an empty one is nothing
+      .map((d) => slash(path.relative(ROOT, path.join(d.parentPath ?? d.path, d.name)))) // .path: Node < 20.12
       .filter((f) => !/(^|\/)(\.git|node_modules)\//.test(f));
   }
 }
@@ -192,7 +216,7 @@ function commitsSince(iso) {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"], // git's "not a git repository" is not the user's problem
     });
-    return /^\d+\s*$/.test(out) ? Number(out) : null;
+    return Number(out);
   } catch {
     return null;
   }
@@ -277,7 +301,9 @@ const cmds = {
     // start, path-scoped records when a matching file is read or edited
     const wanted = {
       SessionStart: { hooks: [{ type: "command", command: "marl prime" }] },
-      PreToolUse: { matcher: "Read|Edit|Write", hooks: [{ type: "command", command: "marl hook" }] },
+      // onFailure: on Windows without Git Bash, Claude Code blocks the tool call when a PreToolUse
+      // hook cannot start (marl missing from a teammate's PATH) unless this says otherwise
+      PreToolUse: { matcher: "Read|Edit|Write", hooks: [{ type: "command", command: "marl hook", onFailure: "continue" }] },
     };
     const file = path.join(process.cwd(), ".claude", "settings.json");
     let settings = {};
@@ -322,7 +348,7 @@ const cmds = {
       type: values.type,
       text: text.join(" "),
       tags: csv(values.tags),
-      paths: csv(values.paths).map(slash),
+      paths: globs(values.paths),
       created: new Date().toISOString(),
       last_used: null,
       confirms: 0,
@@ -423,7 +449,8 @@ const cmds = {
     for (const r of hits) console.log(`${r.domain} ${line(r)}`);
   },
 
-  // Claude Code PreToolUse hook: hook JSON on stdin, context for the model on stdout.
+  // Claude Code PreToolUse hook (PostToolUse works too: the event name is echoed back):
+  // hook JSON on stdin, context for the model on stdout.
   // The output carries no permissionDecision, so it takes no part in allowing the tool call.
   hook() {
     quiet = true;
@@ -438,7 +465,12 @@ const cmds = {
         // ponytail: no lock — parallel tool calls can show a record twice, never lose one.
         // A context compaction also forgets what was shown; `marl for <file>` brings it back.
         const seenFile = path.join(os.tmpdir(), `marl-${session}.json`);
-        const seen = fs.existsSync(seenFile) ? JSON.parse(fs.readFileSync(seenFile, "utf8")) : [];
+        let seen = [];
+        try {
+          // missing, caught half-written by a parallel hook, or not a list: nothing seen yet
+          const was = JSON.parse(fs.readFileSync(seenFile, "utf8"));
+          if (Array.isArray(was)) seen = was;
+        } catch {}
         hits = hits.filter((r) => !seen.includes(r.id));
         if (hits.length) fs.writeFileSync(seenFile, JSON.stringify([...seen, ...hits.map((r) => r.id)]));
       }
@@ -481,7 +513,7 @@ const cmds = {
       type: values.type ?? old.type,
       text: text.join(" "),
       tags: values.tags ? csv(values.tags) : old.tags,
-      paths: values.paths === undefined ? old.paths : csv(values.paths).map(slash), // --paths "" unscopes
+      paths: values.paths === undefined ? old.paths : globs(values.paths), // --paths "" unscopes
       created: new Date().toISOString(),
       last_used: null,
       confirms: 0, // corrected knowledge earns trust again from scratch
@@ -530,14 +562,12 @@ const cmds = {
     const records = load();
     // wall time alone archives everything in a project that merely sat idle; a record is only
     // stale if the project also moved on without anyone confirming it
-    let useGit = minCommits > 0;
     const reasons = new Map();
     const stale = records.filter((r) => {
       const at = new Date(r.last_used ?? r.created);
       if (!(at.getTime() < cutoff)) return false;
-      const n = useGit ? commitsSince(at.toISOString()) : null;
-      if (n === null) useGit = false; // git can't answer here: days-only, and don't ask again
-      else if (n < minCommits) return false;
+      const n = minCommits > 0 ? commitsSince(at.toISOString()) : null; // null: git can't say, days-only
+      if (n !== null && n < minCommits) return false;
       reasons.set(r.id, `unconfirmed for ${days} days` + (n === null ? "" : ` and ${n} commits`));
       return true;
     });
@@ -575,7 +605,8 @@ usage:
   marl for <file...> [--json]
       print the path-scoped records whose globs match these files; silent when none do
   marl hook
-      Claude Code PreToolUse hook: hook JSON on stdin → matching records as context, once per session
+      Claude Code PreToolUse hook (also works as PostToolUse): hook JSON on stdin → matching
+      records as context, once per session
   marl check [--json]
       list path-scoped records whose globs match no project file (read-only)
   marl confirm <id>
@@ -588,7 +619,8 @@ usage:
       archive records unconfirmed for N days AND N commits (days only outside git, or --commits 0)
 
 ids accept any unambiguous prefix. globs: ** crosses directories, * and ? stay within one;
-paths are relative to the directory that holds .marl. nothing is deleted — see .marl/archive.jsonl`);
+--paths is relative to the directory that holds .marl; a directory there means everything
+under it. nothing is deleted — see .marl/archive.jsonl`);
   process.exit(cmd ? 1 : 0);
 }
 cmds[cmd](rest);

@@ -163,7 +163,8 @@ test("init is idempotent and preserves existing settings", () => {
   assert.equal(settings.model, "opus"); // untouched
   assert.ok(settings.hooks.Stop); // untouched
   assert.equal(settings.hooks.SessionStart[0].hooks[0].command, "marl prime");
-  assert.deepEqual(settings.hooks.PreToolUse, [{ matcher: "Read|Edit|Write", hooks: [{ type: "command", command: "marl hook" }] }]);
+  // onFailure: a hook that cannot start (marl missing from PATH) must not block the tool call
+  assert.deepEqual(settings.hooks.PreToolUse, [{ matcher: "Read|Edit|Write", hooks: [{ type: "command", command: "marl hook", onFailure: "continue" }] }]);
 
   out = run().stdout;
   assert.match(out, /instructions up to date/);
@@ -186,7 +187,7 @@ test("init adds the file hook to a 0.2.0 project without touching the hooks alre
   assert.match(out, /PreToolUse → marl hook/);
   const { hooks } = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
   assert.deepEqual(hooks.SessionStart, [prime]); // not duplicated
-  assert.deepEqual(hooks.PreToolUse, [theirs, { matcher: "Read|Edit|Write", hooks: [{ type: "command", command: "marl hook" }] }]);
+  assert.deepEqual(hooks.PreToolUse, [theirs, { matcher: "Read|Edit|Write", hooks: [{ type: "command", command: "marl hook", onFailure: "continue" }] }]);
 });
 
 test("init refreshes its own block, leaves the rest of the file alone", () => {
@@ -284,6 +285,53 @@ test("an id in archive.jsonl stays archived even if knowledge.jsonl still has it
   assert.match(out, /Still alive/);
   assert.doesNotMatch(run("search", "dropped").stdout, /ccc333/);
   assert.equal(run("confirm", "ccc333").status, 1); // gone means gone
+});
+
+test("one id with two different facts is an error, not a silent pick", () => {
+  const run = handStore([
+    rec("aaa111", "Use WAL mode; checkpoint every 1000 pages"), // text corrected by hand on one branch
+    rec("aaa111", "Use WAL mode", { confirms: 1, last_used: "2024-02-01T00:00:00.000Z" }), // confirmed on the other
+    rec("bbb222", "Other fact"),
+  ]);
+  const before = fs.readFileSync(run.file, "utf8");
+  // a write to an unrelated record must not erase the line that lost
+  for (const cmd of [["prime"], ["confirm", "bbb222"], ["drop", "bbb222"]]) {
+    const res = run(...cmd);
+    assert.equal(res.status, 1, cmd.join(" "));
+    assert.match(res.stderr, /knowledge\.jsonl has two different records with id "aaa111"/);
+  }
+  assert.equal(fs.readFileSync(run.file, "utf8"), before);
+  assert.ok(!fs.existsSync(path.join(run.dir, ".marl", "archive.jsonl")));
+
+  // a different scope is a different fact too
+  const scoped = handStore([rec("ccc333", "Same text", { paths: ["src/db/**"] }), rec("ccc333", "Same text", { confirms: 2 })]);
+  assert.equal(scoped("prime").status, 1);
+});
+
+test("record and drop start a new line when the file's last line has no newline", () => {
+  const run = handStore(
+    [rec("aaa111", "Hand written"), rec("bbb222", "To be dropped")],
+    [{ ...rec("ccc333", "Archived earlier"), archived: "2024-05-01T00:00:00.000Z", reason: "dropped" }],
+  );
+  const archiveFile = path.join(run.dir, ".marl", "archive.jsonl");
+  const lines = (file) => fs.readFileSync(file, "utf8").split("\n");
+  // the way a hand edit, or a union merge of one, can leave a file
+  for (const file of [run.file, archiveFile]) fs.writeFileSync(file, fs.readFileSync(file, "utf8").trimEnd());
+
+  assert.equal(run("record", "db", "Appended after the hand edit").status, 0);
+  assert.deepEqual(lines(run.file).map((l) => l && JSON.parse(l).text), ["Hand written", "To be dropped", "Appended after the hand edit", ""]);
+  const res = run("drop", "bbb222", "gone");
+  assert.equal(res.status, 0, res.stderr);
+  assert.deepEqual(lines(archiveFile).map((l) => l && JSON.parse(l).id), ["ccc333", "bbb222", ""]);
+  assert.equal(JSON.parse(run("prime", "--json").stdout).length, 2);
+
+  // a properly terminated or empty file gets no blank line
+  run("record", "db", "One more");
+  assert.doesNotMatch(fs.readFileSync(run.file, "utf8"), /\n\n/);
+  const empty = handStore([]);
+  fs.writeFileSync(empty.file, "");
+  empty("record", "db", "First");
+  assert.match(fs.readFileSync(empty.file, "utf8"), /^\{.*\}\n$/);
 });
 
 const hasGit = spawnSync("git", ["--version"]).status === 0;
@@ -454,6 +502,51 @@ test("record stores --paths, revise carries or replaces them", () => {
   assert.match(bad.stderr, /knowledge\.jsonl:\d+ "paths" must be an array/);
 });
 
+test("--paths is stored root-relative: ./, a directory and an absolute path become globs that match", () => {
+  const run = handStore([]);
+  touch(run.dir, "src/db/conn.js");
+  const from = (cwd, ...a) => spawnSync(process.execPath, [CLI, ...a], { cwd, env, encoding: "utf8" });
+  const stored = (res) => {
+    assert.equal(res.status, 0, res.stderr);
+    const id = res.stdout.match(/(?:recorded|→) \[(\w{6})\]/)[1];
+    return JSON.parse(run("prime", "--json").stdout).find((r) => r.id === id);
+  };
+  const table = [
+    // as typed, as stored, matches src/db/conn.js?
+    ["./src/db/**", "src/db/**", true],
+    [".\\src\\db\\**", "src/db/**", true],
+    ["src/db/", "src/db/**", true],
+    ["src/db", "src/db/**", true], // a directory on disk means everything under it
+    ["src/new/", "src/new/**", false], // a trailing slash says "directory" before it exists
+    ["src/db/conn.js", "src/db/conn.js", true], // a file stays a file
+    ["src/db/../db/*.js", "src/db/*.js", true],
+    [path.join(run.dir, "src", "db", "**"), "src/db/**", true], // absolute, as an agent often has it
+    [path.join(run.dir, "src", "db"), "src/db/**", true],
+    [".", "**", true],
+  ];
+  const ids = table.map(([typed, expected], i) => {
+    const r = stored(run("record", "db", `row ${i}`, "--paths", typed));
+    assert.deepEqual(r.paths, [expected], `--paths ${typed}`);
+    return r.id;
+  });
+  const hits = JSON.parse(run("for", "src/db/conn.js", "--json").stdout).map((r) => r.id);
+  assert.deepEqual(hits, ids.filter((_, i) => table[i][2]));
+
+  // revise goes through the same door
+  assert.deepEqual(stored(run("revise", ids[4], "Now in db", "--paths", "./src/db/")).paths, ["src/db/**"]);
+  // from a subdirectory a relative glob is still relative to the project root, not to cwd
+  assert.deepEqual(stored(from(path.join(run.dir, "src", "db"), "record", "db", "From a subdirectory", "--paths", "migrations/*.sql")).paths, ["migrations/*.sql"]);
+
+  // outside the project nothing can ever match: refused, nothing recorded
+  const count = JSON.parse(run("prime", "--json").stdout).length;
+  for (const outside of ["../elsewhere/**", path.join(path.dirname(run.dir), "elsewhere", "**")]) {
+    const res = run("record", "db", "Never matches", "--paths", outside);
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, /is outside the project/);
+  }
+  assert.equal(JSON.parse(run("prime", "--json").stdout).length, count);
+});
+
 test("for: files relative to cwd, absolute, from a subdirectory; outside the project matches nothing", () => {
   const run = handStore([
     rec("aaa111", "DB fact", { paths: ["src/db/**"] }),
@@ -550,6 +643,17 @@ test("hook: adds matching records as PreToolUse context, once per session, and n
   // the session id is sanitised before it becomes a file name
   assert.match(hook(dbFile, { session_id: "../../evil/s4" }).stdout, /aaa111/);
   assert.deepEqual(fs.readdirSync(tmp).sort(), ["marl-evils4-.json", "marl-s1-.json", "marl-s1-sub1.json", "marl-s2-.json", "marl-s3-.json"]);
+
+  // a seen file that is corrupt, empty (a parallel hook mid-write) or not a list means "nothing
+  // seen yet": the records are shown, perhaps a second time, and the file is a list again
+  for (const [i, junk] of ["{corrupt", "", '{"a":1}', "null"].entries()) {
+    fs.writeFileSync(path.join(tmp, `marl-junk${i}-.json`), junk);
+    assert.match(hook(dbFile, { session_id: `junk${i}` }).stdout, /aaa111/, `seen file holding ${JSON.stringify(junk)}`);
+    silent(hook(dbFile, { session_id: `junk${i}` }));
+  }
+
+  // registered as a PostToolUse hook it answers under that event name
+  assert.equal(JSON.parse(hook(dbFile, { hook_event_name: "PostToolUse" }).stdout).hookSpecificOutput.hookEventName, "PostToolUse");
 
   silent(hook(path.join(run.dir, "README.md"), { session_id: "s5" })); // no record matches
   silent(hook(path.join(path.dirname(run.dir), "elsewhere", "x.js"), { session_id: "s5" })); // outside the project
@@ -664,6 +768,27 @@ test("check flags records whose globs match no file git knows about", { skip: ha
   assert.deepEqual(JSON.parse(run("check", "--json").stdout), []);
 });
 
+test("check keeps to git's file list when it is larger than Node's default 1 MiB buffer", { skip: hasGit ? false : "git not on PATH" }, () => {
+  const run = handStore([rec("aaa111", "Ignored build output", { paths: ["build/**"] }), rec("bbb222", "Big tree fact", { paths: ["big/**"] })]);
+  const git = (args, input = "") => {
+    const res = spawnSync("git", ["-C", run.dir, ...args], { encoding: "utf8", input, maxBuffer: 1 << 26 });
+    assert.equal(res.status, 0, res.stderr);
+    return res.stdout;
+  };
+  git(["init"]);
+  fs.writeFileSync(path.join(run.dir, ".gitignore"), "build/\n");
+  touch(run.dir, "build/out.js"); // on disk but ignored: only the directory walk would count it
+  // index entries only — 1500 paths of 800 characters need not exist on disk to be listed
+  const blob = git(["hash-object", "-w", "--stdin"]).trim();
+  const deep = Array(4).fill("d".repeat(200)).join("/");
+  git(["update-index", "--index-info"], Array.from({ length: 1500 }, (_, i) => `100644 ${blob}\tbig/${deep}/f${i}.js\n`).join(""));
+  assert.ok(git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"]).length > 1 << 20, "the listing must overflow the default buffer");
+
+  const res = run("check", "--json");
+  assert.equal(res.status, 0, res.stderr);
+  assert.deepEqual(JSON.parse(res.stdout).map((r) => r.id), ["aaa111"]);
+});
+
 test("check outside a git repo walks the directory, skipping .git and node_modules", () => {
   const run = handStore([
     rec("aaa111", "Live fact", { paths: ["src/db/*.js"] }),
@@ -671,8 +796,12 @@ test("check outside a git repo walks the directory, skipping .git and node_modul
     rec("ccc333", "Dependency internals", { paths: ["**/node_modules/**"] }),
     rec("ddd444", "Git internals", { paths: [".git/**"] }),
     rec("eee555", "Unscoped fact"),
+    // only files count, as in git: a glob that matches nothing but a directory is orphaned
+    rec("fff666", "Hand-edited bare directory", { paths: ["src/db"] }),
+    rec("ggg777", "Files all gone", { paths: ["old/**", "src/*"] }),
   ]);
   touch(run.dir, "src/db/conn.js");
+  fs.mkdirSync(path.join(run.dir, "old", "deep"), { recursive: true }); // empty directories
   touch(run.dir, "node_modules/pkg/index.js");
   touch(run.dir, "packages/a/node_modules/pkg/index.js");
   touch(run.dir, ".git/hooks/x"); // not a repository git accepts, so this is still the fallback
@@ -684,11 +813,14 @@ test("check outside a git repo walks the directory, skipping .git and node_modul
     "orphaned db - [bbb222] (note) Orphaned fact @src/api/**",
     "orphaned db - [ccc333] (note) Dependency internals @**/node_modules/**",
     "orphaned db - [ddd444] (note) Git internals @.git/**",
+    "orphaned db - [fff666] (note) Hand-edited bare directory @src/db",
+    "orphaned db - [ggg777] (note) Files all gone @old/** @src/*",
     HINT,
   ]);
 
   touch(run.dir, "src/api/deep/handler.js");
-  assert.deepEqual(JSON.parse(run("check", "--json").stdout).map((r) => r.id), ["ccc333", "ddd444"]);
+  touch(run.dir, "src/index.js");
+  assert.deepEqual(JSON.parse(run("check", "--json").stdout).map((r) => r.id), ["ccc333", "ddd444", "fff666"]);
 });
 
 test("--version reports the package version", () => {
