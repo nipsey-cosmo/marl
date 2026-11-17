@@ -7,10 +7,10 @@ Agents record learnings as they work; future sessions prime them back into conte
 ## Install
 
 ```bash
-npm install -g github:profesr-chaos/marl
+npm install -g github:nipsey-cosmo/marl
 ```
 
-Or from a local clone: `npm link`. Pin a release with `#v0.2.0`; check what you have with `marl --version`.
+Or from a local clone: `npm link`. Pin a release with `#v0.3.0`; check what you have with `marl --version`.
 
 ### Upgrading
 
