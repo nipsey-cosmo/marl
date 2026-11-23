@@ -10,7 +10,7 @@ Agents record learnings as they work; future sessions prime them back into conte
 npm install -g github:nipsey-cosmo/marl
 ```
 
-Or from a local clone: `npm link`. Pin a release with `#v0.3.0`; check what you have with `marl --version`.
+Or from a local clone: `npm link`. Pin a release with `#v0.3.1`; check what you have with `marl --version`.
 
 ### Upgrading
 
